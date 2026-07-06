@@ -1,0 +1,952 @@
+############################################################
+# Mediation Analyses
+#
+# This script performs the primary mediation analyses for
+# social exposome measures, epigenetic age acceleration (EAA),
+# brain age gap (BAG), and clinical outcomes.
+#
+# Mediation models are performed in the full sample and within
+# diagnostic strata:
+#   - Dementia
+#   - Control
+#   - HC
+#   - AD
+#   - FTD
+#
+# Mediation frameworks:
+#
+#   1. EAA-mediated models
+#      Social exposure -> EAA -> clinical outcome
+#
+#   2. BAG-mediated models
+#      Social exposure -> BAG -> clinical outcome
+#
+# Bootstrap:
+#   - 5,000 nonparametric bootstrap resamples
+#
+# Model specifications:
+#
+#   Full-sample EAA mediation:
+#     Mediator model:
+#       EAA ~ social exposure + age + sex + smoking + site + diagnosis
+#     Outcome model:
+#       clinical outcome ~ social exposure + EAA + age + sex + smoking + site + diagnosis
+#
+#   Stratified EAA mediation:
+#     Mediator model:
+#       EAA ~ social exposure + age + sex + smoking + site
+#     Outcome model:
+#       clinical outcome ~ social exposure + EAA + age + sex + smoking + site
+#
+#   BAG mediation:
+#     Mediator model:
+#       BAG ~ social exposure + age + sex + smoking
+#     Outcome model:
+#       clinical outcome ~ social exposure + BAG + age + sex + smoking
+#
+# Outputs:
+#   - ACME / indirect effect
+#   - ADE / direct effect
+#   - Total effect
+#   - Proportion mediated
+#   - 95% bootstrap confidence intervals
+#   - p-values
+#   - Benjamini-Hochberg FDR
+#   - Path a, path b, path c, and path c'
+#   - Model-wise sample size
+############################################################
+
+# ------------------------------------------------------------
+# Packages
+# ------------------------------------------------------------
+
+required_packages <- c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "broom",
+  "tibble",
+  "stringr",
+  "openxlsx",
+  "mediation"
+)
+
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(tibble)
+library(stringr)
+library(openxlsx)
+library(mediation)
+
+# ------------------------------------------------------------
+# Project configuration
+# ------------------------------------------------------------
+
+project_dir <- "."
+
+input_file <- file.path(
+  project_dir,
+  "data",
+  "analysis_dataset.xlsx"
+)
+
+output_dir <- file.path(
+  project_dir,
+  "results",
+  "mediation_analyses"
+)
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+file_type <- "xlsx"   # options: "xlsx" or "csv"
+
+n_boot <- 5000
+set.seed(20260706)
+
+# ------------------------------------------------------------
+# Variable definitions
+# ------------------------------------------------------------
+# Replace only the values on the right if your local dataset uses
+# different column names.
+
+# Covariates
+var_age       <- "Decimal.Chronological.Age"
+var_sex       <- "demo_sex"
+var_smoking   <- "demo_smoke"
+var_site      <- "demo_resid"
+var_diagnosis <- "diagnosiscognormal"
+var_clinical  <- "clinical_diagnosis"
+
+# Expected coding:
+# var_diagnosis should identify Dementia and Control.
+# var_clinical should identify HC/CN, AD, and FTD.
+diagnosis_binary_levels <- list(
+  Dementia = c("Dementia", "dementia", "Case", "case", "0", 0),
+  Control  = c("Control", "control", "CN", "HC", "1", 1)
+)
+
+clinical_levels <- list(
+  HC  = c("HC", "CN", "Control", "control"),
+  AD  = c("AD", "Alzheimer", "Alzheimer disease"),
+  FTD = c("FTD", "Frontotemporal dementia")
+)
+
+# Social exposome measures
+global_social_vars <- c(
+  CSRI = "GPRI_reconstructed",
+  MSE  = "MSE_global_risk"
+)
+
+social_domain_vars <- c(
+  Education       = "GPRI_domain_education",
+  `Social support` = "GPRI_domain_social_support",
+  Adversities    = "GPRI_domain_adversities",
+  Socioeconomics = "GPRI_domain_socioeconomic_conditions"
+)
+
+social_exposures <- c(
+  global_social_vars,
+  social_domain_vars
+)
+
+# EAA mediators
+eaa_mediators <- c(
+  PhenoAge        = "EAA_PhenoAge",
+  Hannum          = "EAA_Hannum",
+  Horvath         = "EAA_Horvath",
+  DNAmFitAge      = "EAA_DNAmFitAge",
+  Blood           = "EAA_Blood",
+  Brain           = "EAA_Brain",
+  Heart           = "EAA_Heart",
+  Immune          = "EAA_Immune",
+  Inflammation    = "EAA_Inflammation",
+  Kidney          = "EAA_Kidney",
+  Liver           = "EAA_Liver",
+  Lung            = "EAA_Lung",
+  MusculoSkeletal = "EAA_MusculoSkeletal",
+  OMICmAge        = "EAA_OMICmAge",
+  Retroclock      = "EAA_Retroclock",
+  Hormone         = "EAA_Hormone",
+  Metabolic       = "EAA_Metabolic",
+  SystemsAge      = "EAA_SystemsAge"
+)
+
+# BAG mediators
+bag_mediators <- c(
+  `Functional BAG` = "BAG_funct",
+  `Structural BAG` = "BAG_structural"
+)
+
+# Clinical outcomes
+clinical_outcomes <- c(
+  MMSE           = "mmse_total",
+  CDR            = "CDR",
+  `T-ADLQ total` = "t_adlq_total_score5"
+)
+
+# ------------------------------------------------------------
+# Data import
+# ------------------------------------------------------------
+
+if (file_type == "xlsx") {
+  dat_raw <- readxl::read_excel(input_file)
+} else if (file_type == "csv") {
+  dat_raw <- read.csv(input_file, stringsAsFactors = FALSE)
+} else {
+  stop("file_type must be either 'xlsx' or 'csv'.")
+}
+
+# ------------------------------------------------------------
+# Data preparation
+# ------------------------------------------------------------
+
+all_numeric_vars <- unique(c(
+  unname(social_exposures),
+  unname(eaa_mediators),
+  unname(bag_mediators),
+  unname(clinical_outcomes),
+  var_age
+))
+
+all_factor_vars <- unique(c(
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis,
+  var_clinical
+))
+
+required_vars <- unique(c(all_numeric_vars, all_factor_vars))
+missing_vars <- setdiff(required_vars, names(dat_raw))
+
+if (length(missing_vars) > 0) {
+  cat("\nMissing variables:\n")
+  print(missing_vars)
+  stop("Update the variable dictionary at the top of the script.")
+}
+
+dat <- dat_raw %>%
+  mutate(
+    across(all_of(all_numeric_vars), as.numeric),
+    across(all_of(all_factor_vars), as.factor)
+  )
+
+# ------------------------------------------------------------
+# Model specifications
+# ------------------------------------------------------------
+
+covars_eaa_full <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis
+)
+
+covars_eaa_stratified <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site
+)
+
+covars_bag_full <- c(
+  var_age,
+  var_sex,
+  var_smoking
+)
+
+covars_bag_stratified <- c(
+  var_age,
+  var_sex,
+  var_smoking
+)
+
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+
+format_p <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ "<0.001",
+    p < 0.01 ~ "<0.01",
+    p < 0.05 ~ "<0.05",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+format_ci <- function(low, high, digits = 3) {
+  dplyr::case_when(
+    is.na(low) | is.na(high) ~ NA_character_,
+    TRUE ~ paste0(
+      "[",
+      sprintf(paste0("%.", digits, "f"), low),
+      ", ",
+      sprintf(paste0("%.", digits, "f"), high),
+      "]"
+    )
+  )
+}
+
+extract_beta_p <- function(model, term) {
+  sm <- summary(model)$coefficients
+
+  if (!term %in% rownames(sm)) {
+    return(tibble(beta = NA_real_, p_value = NA_real_))
+  }
+
+  p_col <- grep("Pr\\(", colnames(sm), value = TRUE)[1]
+
+  tibble(
+    beta = unname(sm[term, "Estimate"]),
+    p_value = unname(sm[term, p_col])
+  )
+}
+
+drop_bad_covars <- function(df, covariates) {
+  covars_present <- intersect(covariates, names(df))
+
+  keep <- purrr::map_lgl(
+    covars_present,
+    function(v) {
+      x <- df[[v]]
+
+      if (is.numeric(x)) {
+        return(sd(x, na.rm = TRUE) > 0)
+      }
+
+      if (is.factor(x) || is.character(x)) {
+        return(length(unique(stats::na.omit(x))) > 1)
+      }
+
+      TRUE
+    }
+  )
+
+  covars_present[keep]
+}
+
+make_stratum <- function(data, stratum_name) {
+
+  if (stratum_name == "Full sample") {
+    return(data)
+  }
+
+  if (stratum_name %in% c("Dementia", "Control")) {
+    keep_values <- diagnosis_binary_levels[[stratum_name]]
+    return(
+      data %>%
+        filter(as.character(.data[[var_diagnosis]]) %in% as.character(keep_values))
+    )
+  }
+
+  if (stratum_name %in% c("HC", "AD", "FTD")) {
+    keep_values <- clinical_levels[[stratum_name]]
+    return(
+      data %>%
+        filter(as.character(.data[[var_clinical]]) %in% as.character(keep_values))
+    )
+  }
+
+  stop("Unknown stratum: ", stratum_name)
+}
+
+get_covariates <- function(mediator_family, stratum_name) {
+  is_full <- stratum_name == "Full sample"
+
+  if (mediator_family == "EAA") {
+    if (is_full) return(covars_eaa_full)
+    return(covars_eaa_stratified)
+  }
+
+  if (mediator_family == "BAG") {
+    if (is_full) return(covars_bag_full)
+    return(covars_bag_stratified)
+  }
+
+  stop("Unknown mediator family: ", mediator_family)
+}
+
+fit_lm_safe <- function(formula, data) {
+  tryCatch(
+    lm(formula, data = data),
+    error = function(e) NULL
+  )
+}
+
+# ------------------------------------------------------------
+# Core mediation function
+# ------------------------------------------------------------
+
+run_single_mediation <- function(data,
+                                 exposure_var,
+                                 mediator_var,
+                                 outcome_var,
+                                 covariates,
+                                 mediator_family,
+                                 stratum_name,
+                                 exposure_label,
+                                 mediator_label,
+                                 outcome_label,
+                                 n_boot) {
+
+  model_vars <- unique(c(
+    exposure_var,
+    mediator_var,
+    outcome_var,
+    covariates
+  ))
+
+  df <- data %>%
+    select(all_of(model_vars)) %>%
+    na.omit() %>%
+    as.data.frame()
+
+  covariates_use <- drop_bad_covars(df, covariates)
+
+  empty_result <- tibble(
+    mediator_family = mediator_family,
+    stratum = stratum_name,
+    exposure = exposure_label,
+    mediator = mediator_label,
+    outcome = outcome_label,
+    exposure_raw = exposure_var,
+    mediator_raw = mediator_var,
+    outcome_raw = outcome_var,
+    n = nrow(df),
+    bootstraps = n_boot,
+    path_a_beta = NA_real_,
+    path_a_p = NA_real_,
+    path_b_beta = NA_real_,
+    path_b_p = NA_real_,
+    path_c_total_beta = NA_real_,
+    path_c_total_p = NA_real_,
+    path_c_prime_beta = NA_real_,
+    path_c_prime_p = NA_real_,
+    acme = NA_real_,
+    acme_ci_low = NA_real_,
+    acme_ci_high = NA_real_,
+    acme_p = NA_real_,
+    ade = NA_real_,
+    ade_ci_low = NA_real_,
+    ade_ci_high = NA_real_,
+    ade_p = NA_real_,
+    total_effect = NA_real_,
+    total_effect_ci_low = NA_real_,
+    total_effect_ci_high = NA_real_,
+    total_effect_p = NA_real_,
+    prop_mediated = NA_real_,
+    prop_mediated_ci_low = NA_real_,
+    prop_mediated_ci_high = NA_real_,
+    prop_mediated_p = NA_real_,
+    covariates = paste(covariates_use, collapse = " + "),
+    note = NA_character_
+  )
+
+  if (nrow(df) < 30) {
+    empty_result$note <- "Insufficient complete cases"
+    return(empty_result)
+  }
+
+  if (sd(df[[exposure_var]], na.rm = TRUE) == 0 ||
+      sd(df[[mediator_var]], na.rm = TRUE) == 0 ||
+      sd(df[[outcome_var]], na.rm = TRUE) == 0) {
+    empty_result$note <- "Zero variance in exposure, mediator, or outcome"
+    return(empty_result)
+  }
+
+  mediator_formula <- reformulate(
+    termlabels = c(exposure_var, covariates_use),
+    response = mediator_var
+  )
+
+  outcome_formula <- reformulate(
+    termlabels = c(exposure_var, mediator_var, covariates_use),
+    response = outcome_var
+  )
+
+  total_formula <- reformulate(
+    termlabels = c(exposure_var, covariates_use),
+    response = outcome_var
+  )
+
+  mediator_model <- fit_lm_safe(mediator_formula, df)
+  outcome_model <- fit_lm_safe(outcome_formula, df)
+  total_model <- fit_lm_safe(total_formula, df)
+
+  if (is.null(mediator_model) || is.null(outcome_model) || is.null(total_model)) {
+    empty_result$note <- "Model failed"
+    return(empty_result)
+  }
+
+  path_a <- extract_beta_p(mediator_model, exposure_var)
+  path_b <- extract_beta_p(outcome_model, mediator_var)
+  path_c_prime <- extract_beta_p(outcome_model, exposure_var)
+  path_c <- extract_beta_p(total_model, exposure_var)
+
+  med_fit <- tryCatch(
+    mediation::mediate(
+      model.m = mediator_model,
+      model.y = outcome_model,
+      treat = exposure_var,
+      mediator = mediator_var,
+      boot = TRUE,
+      sims = n_boot
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(med_fit, "error")) {
+    out <- empty_result
+    out$path_a_beta <- path_a$beta
+    out$path_a_p <- path_a$p_value
+    out$path_b_beta <- path_b$beta
+    out$path_b_p <- path_b$p_value
+    out$path_c_total_beta <- path_c$beta
+    out$path_c_total_p <- path_c$p_value
+    out$path_c_prime_beta <- path_c_prime$beta
+    out$path_c_prime_p <- path_c_prime$p_value
+    out$note <- paste0("Mediation failed: ", med_fit$message)
+    return(out)
+  }
+
+  tibble(
+    mediator_family = mediator_family,
+    stratum = stratum_name,
+    exposure = exposure_label,
+    mediator = mediator_label,
+    outcome = outcome_label,
+    exposure_raw = exposure_var,
+    mediator_raw = mediator_var,
+    outcome_raw = outcome_var,
+    n = nrow(df),
+    bootstraps = n_boot,
+
+    path_a_beta = path_a$beta,
+    path_a_p = path_a$p_value,
+    path_b_beta = path_b$beta,
+    path_b_p = path_b$p_value,
+    path_c_total_beta = path_c$beta,
+    path_c_total_p = path_c$p_value,
+    path_c_prime_beta = path_c_prime$beta,
+    path_c_prime_p = path_c_prime$p_value,
+
+    acme = med_fit$d.avg,
+    acme_ci_low = med_fit$d.avg.ci[1],
+    acme_ci_high = med_fit$d.avg.ci[2],
+    acme_p = med_fit$d.avg.p,
+
+    ade = med_fit$z.avg,
+    ade_ci_low = med_fit$z.avg.ci[1],
+    ade_ci_high = med_fit$z.avg.ci[2],
+    ade_p = med_fit$z.avg.p,
+
+    total_effect = med_fit$tau.coef,
+    total_effect_ci_low = med_fit$tau.ci[1],
+    total_effect_ci_high = med_fit$tau.ci[2],
+    total_effect_p = med_fit$tau.p,
+
+    prop_mediated = med_fit$n.avg,
+    prop_mediated_ci_low = med_fit$n.avg.ci[1],
+    prop_mediated_ci_high = med_fit$n.avg.ci[2],
+    prop_mediated_p = med_fit$n.avg.p,
+
+    covariates = paste(covariates_use, collapse = " + "),
+    note = NA_character_
+  )
+}
+
+run_mediation_grid <- function(data,
+                               exposures,
+                               mediators,
+                               outcomes,
+                               mediator_family,
+                               stratum_name,
+                               n_boot) {
+
+  covariates <- get_covariates(
+    mediator_family = mediator_family,
+    stratum_name = stratum_name
+  )
+
+  tidyr::crossing(
+    exposure_label = names(exposures),
+    mediator_label = names(mediators),
+    outcome_label = names(outcomes)
+  ) %>%
+    pmap_dfr(
+      function(exposure_label, mediator_label, outcome_label) {
+        run_single_mediation(
+          data = data,
+          exposure_var = exposures[[exposure_label]],
+          mediator_var = mediators[[mediator_label]],
+          outcome_var = outcomes[[outcome_label]],
+          covariates = covariates,
+          mediator_family = mediator_family,
+          stratum_name = stratum_name,
+          exposure_label = exposure_label,
+          mediator_label = mediator_label,
+          outcome_label = outcome_label,
+          n_boot = n_boot
+        )
+      }
+    ) %>%
+    group_by(mediator_family, stratum, exposure, outcome) %>%
+    mutate(
+      acme_FDR_by_exposure_outcome = p.adjust(acme_p, method = "fdr")
+    ) %>%
+    ungroup() %>%
+    group_by(mediator_family, stratum) %>%
+    mutate(
+      acme_FDR_global = p.adjust(acme_p, method = "fdr")
+    ) %>%
+    ungroup()
+}
+
+format_mediation_results <- function(df) {
+  df %>%
+    mutate(
+      path_a_beta = round(path_a_beta, 4),
+      path_b_beta = round(path_b_beta, 4),
+      path_c_total_beta = round(path_c_total_beta, 4),
+      path_c_prime_beta = round(path_c_prime_beta, 4),
+
+      acme = round(acme, 4),
+      acme_ci = format_ci(acme_ci_low, acme_ci_high, digits = 4),
+      ade = round(ade, 4),
+      ade_ci = format_ci(ade_ci_low, ade_ci_high, digits = 4),
+      total_effect = round(total_effect, 4),
+      total_effect_ci = format_ci(total_effect_ci_low, total_effect_ci_high, digits = 4),
+      prop_mediated = round(prop_mediated, 4),
+      prop_mediated_ci = format_ci(prop_mediated_ci_low, prop_mediated_ci_high, digits = 4),
+
+      path_a_p = format_p(path_a_p),
+      path_b_p = format_p(path_b_p),
+      path_c_total_p = format_p(path_c_total_p),
+      path_c_prime_p = format_p(path_c_prime_p),
+      acme_p = format_p(acme_p),
+      ade_p = format_p(ade_p),
+      total_effect_p = format_p(total_effect_p),
+      prop_mediated_p = format_p(prop_mediated_p),
+      acme_FDR_by_exposure_outcome = format_p(acme_FDR_by_exposure_outcome),
+      acme_FDR_global = format_p(acme_FDR_global)
+    ) %>%
+    select(
+      mediator_family,
+      stratum,
+      exposure,
+      mediator,
+      outcome,
+      n,
+      bootstraps,
+
+      path_a_beta,
+      path_a_p,
+      path_b_beta,
+      path_b_p,
+      path_c_total_beta,
+      path_c_total_p,
+      path_c_prime_beta,
+      path_c_prime_p,
+
+      acme,
+      acme_ci,
+      acme_p,
+      acme_FDR_by_exposure_outcome,
+      acme_FDR_global,
+
+      ade,
+      ade_ci,
+      ade_p,
+
+      total_effect,
+      total_effect_ci,
+      total_effect_p,
+
+      prop_mediated,
+      prop_mediated_ci,
+      prop_mediated_p,
+
+      covariates,
+      note,
+      exposure_raw,
+      mediator_raw,
+      outcome_raw
+    )
+}
+
+# ------------------------------------------------------------
+# Primary mediation analyses
+# ------------------------------------------------------------
+
+strata_to_run <- c(
+  "Full sample",
+  "Dementia",
+  "Control",
+  "HC",
+  "AD",
+  "FTD"
+)
+
+all_mediation_results <- list()
+
+for (stratum_name in strata_to_run) {
+
+  cat("\n====================================================\n")
+  cat("Stratum:", stratum_name, "\n")
+
+  dat_s <- make_stratum(dat, stratum_name)
+  cat("N before model-wise complete case filtering:", nrow(dat_s), "\n")
+
+  cat("\nRunning EAA mediation models\n")
+  eaa_res <- run_mediation_grid(
+    data = dat_s,
+    exposures = social_exposures,
+    mediators = eaa_mediators,
+    outcomes = clinical_outcomes,
+    mediator_family = "EAA",
+    stratum_name = stratum_name,
+    n_boot = n_boot
+  )
+
+  all_mediation_results[[paste(stratum_name, "EAA", sep = "__")]] <- eaa_res
+
+  cat("\nRunning BAG mediation models\n")
+  bag_res <- run_mediation_grid(
+    data = dat_s,
+    exposures = social_exposures,
+    mediators = bag_mediators,
+    outcomes = clinical_outcomes,
+    mediator_family = "BAG",
+    stratum_name = stratum_name,
+    n_boot = n_boot
+  )
+
+  all_mediation_results[[paste(stratum_name, "BAG", sep = "__")]] <- bag_res
+}
+
+mediation_results_raw <- bind_rows(all_mediation_results)
+mediation_results_formatted <- format_mediation_results(mediation_results_raw)
+
+# ------------------------------------------------------------
+# Convenience tables
+# ------------------------------------------------------------
+
+mediation_summary <- mediation_results_raw %>%
+  mutate(
+    acme_nominal = acme_p < 0.05,
+    acme_fdr_by_exposure_outcome = acme_FDR_by_exposure_outcome < 0.05,
+    acme_fdr_global = acme_FDR_global < 0.05,
+    path_a_sig = path_a_p < 0.05,
+    path_b_sig = path_b_p < 0.05
+  ) %>%
+  group_by(mediator_family, stratum) %>%
+  summarise(
+    n_models = n(),
+    n_acme_nominal = sum(acme_nominal, na.rm = TRUE),
+    n_acme_fdr_by_exposure_outcome = sum(acme_fdr_by_exposure_outcome, na.rm = TRUE),
+    n_acme_fdr_global = sum(acme_fdr_global, na.rm = TRUE),
+    n_path_a_sig = sum(path_a_sig, na.rm = TRUE),
+    n_path_b_sig = sum(path_b_sig, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+nominal_acme <- mediation_results_raw %>%
+  filter(!is.na(acme_p), acme_p < 0.05) %>%
+  arrange(mediator_family, stratum, acme_p)
+
+fdr_acme_by_exposure_outcome <- mediation_results_raw %>%
+  filter(
+    !is.na(acme_FDR_by_exposure_outcome),
+    acme_FDR_by_exposure_outcome < 0.05
+  ) %>%
+  arrange(mediator_family, stratum, acme_FDR_by_exposure_outcome)
+
+fdr_acme_global <- mediation_results_raw %>%
+  filter(
+    !is.na(acme_FDR_global),
+    acme_FDR_global < 0.05
+  ) %>%
+  arrange(mediator_family, stratum, acme_FDR_global)
+
+acme_and_paths_nominal <- mediation_results_raw %>%
+  filter(
+    !is.na(acme_p), acme_p < 0.05,
+    !is.na(path_a_p), path_a_p < 0.05,
+    !is.na(path_b_p), path_b_p < 0.05
+  ) %>%
+  arrange(mediator_family, stratum, acme_p)
+
+# ------------------------------------------------------------
+# Export results: CSV files
+# ------------------------------------------------------------
+
+write.csv(
+  mediation_results_raw,
+  file.path(output_dir, "mediation_results_all_raw.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  mediation_results_formatted,
+  file.path(output_dir, "mediation_results_all_formatted.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  mediation_summary,
+  file.path(output_dir, "mediation_summary.csv"),
+  row.names = FALSE
+)
+
+# Separate CSV files by mediator family and stratum
+for (stratum_name in strata_to_run) {
+
+  safe_stratum <- str_replace_all(stratum_name, "[^A-Za-z0-9]+", "_")
+
+  for (family_i in c("EAA", "BAG")) {
+
+    df_i <- mediation_results_raw %>%
+      filter(stratum == stratum_name, mediator_family == family_i)
+
+    write.csv(
+      df_i,
+      file.path(output_dir, paste0("raw_", safe_stratum, "_", family_i, "_mediation.csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      format_mediation_results(df_i),
+      file.path(output_dir, paste0("formatted_", safe_stratum, "_", family_i, "_mediation.csv")),
+      row.names = FALSE
+    )
+  }
+}
+
+# ------------------------------------------------------------
+# Export results: Excel workbook
+# ------------------------------------------------------------
+
+make_excel_sheet_name <- function(stratum_name, mediator_family, existing_names) {
+
+  stratum_code <- dplyr::case_when(
+    stratum_name == "Full sample" ~ "Full",
+    TRUE ~ stringr::str_replace_all(stratum_name, "[^A-Za-z0-9]+", "_")
+  )
+
+  base_name <- substr(paste0(stratum_code, "_", mediator_family), 1, 31)
+  sheet_name <- base_name
+  suffix <- 1
+
+  while (sheet_name %in% existing_names) {
+    suffix_txt <- paste0("_", suffix)
+    sheet_name <- paste0(substr(base_name, 1, 31 - nchar(suffix_txt)), suffix_txt)
+    suffix <- suffix + 1
+  }
+
+  sheet_name
+}
+
+wb <- createWorkbook()
+
+# One formatted sheet per mediator family x stratum
+existing_sheet_names <- character(0)
+
+for (stratum_name in strata_to_run) {
+
+  for (family_i in c("EAA", "BAG")) {
+
+    sheet_name <- make_excel_sheet_name(
+      stratum_name = stratum_name,
+      mediator_family = family_i,
+      existing_names = existing_sheet_names
+    )
+
+    existing_sheet_names <- c(existing_sheet_names, sheet_name)
+
+    df_sheet <- mediation_results_raw %>%
+      filter(stratum == stratum_name, mediator_family == family_i) %>%
+      format_mediation_results()
+
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, df_sheet)
+    setColWidths(wb, sheet_name, cols = 1:ncol(df_sheet), widths = "auto")
+  }
+}
+
+addWorksheet(wb, "Summary")
+writeData(wb, "Summary", mediation_summary)
+setColWidths(wb, "Summary", cols = 1:ncol(mediation_summary), widths = "auto")
+
+addWorksheet(wb, "Nominal_ACME")
+writeData(wb, "Nominal_ACME", format_mediation_results(nominal_acme))
+setColWidths(wb, "Nominal_ACME", cols = 1:ncol(format_mediation_results(nominal_acme)), widths = "auto")
+
+addWorksheet(wb, "FDR_ACME_by_exp_out")
+writeData(wb, "FDR_ACME_by_exp_out", format_mediation_results(fdr_acme_by_exposure_outcome))
+setColWidths(wb, "FDR_ACME_by_exp_out", cols = 1:ncol(format_mediation_results(fdr_acme_by_exposure_outcome)), widths = "auto")
+
+addWorksheet(wb, "FDR_ACME_global")
+writeData(wb, "FDR_ACME_global", format_mediation_results(fdr_acme_global))
+setColWidths(wb, "FDR_ACME_global", cols = 1:ncol(format_mediation_results(fdr_acme_global)), widths = "auto")
+
+addWorksheet(wb, "ACME_and_paths_nominal")
+writeData(wb, "ACME_and_paths_nominal", format_mediation_results(acme_and_paths_nominal))
+setColWidths(wb, "ACME_and_paths_nominal", cols = 1:ncol(format_mediation_results(acme_and_paths_nominal)), widths = "auto")
+
+addWorksheet(wb, "All_raw")
+writeData(wb, "All_raw", mediation_results_raw)
+setColWidths(wb, "All_raw", cols = 1:ncol(mediation_results_raw), widths = "auto")
+
+addWorksheet(wb, "All_formatted")
+writeData(wb, "All_formatted", mediation_results_formatted)
+setColWidths(wb, "All_formatted", cols = 1:ncol(mediation_results_formatted), widths = "auto")
+
+model_info <- tibble(
+  Mediator_family = c("EAA", "BAG"),
+  Full_sample_covariates = c(
+    paste(covars_eaa_full, collapse = " + "),
+    paste(covars_bag_full, collapse = " + ")
+  ),
+  Stratified_covariates = c(
+    paste(covars_eaa_stratified, collapse = " + "),
+    paste(covars_bag_stratified, collapse = " + ")
+  ),
+  Bootstrap = paste0(n_boot, " nonparametric bootstrap resamples"),
+  FDR = "Benjamini-Hochberg correction applied to ACME p-values within mediator family, stratum, exposure, and outcome; global ACME FDR also provided within mediator family and stratum",
+  Paths = "Path a: mediator ~ exposure + covariates; path b and c': outcome ~ exposure + mediator + covariates; path c: outcome ~ exposure + covariates"
+)
+
+addWorksheet(wb, "Model_info")
+writeData(wb, "Model_info", model_info)
+setColWidths(wb, "Model_info", cols = 1:ncol(model_info), widths = "auto")
+
+saveWorkbook(
+  wb,
+  file.path(output_dir, "mediation_results_all_strata_boot5000.xlsx"),
+  overwrite = TRUE
+)
+
+cat("\n====================================================\n")
+cat("All mediation analyses completed.\n")
+cat("Outputs saved in:\n")
+cat(output_dir, "\n\n")
+cat("Main files:\n")
+cat("- mediation_results_all_raw.csv\n")
+cat("- mediation_results_all_formatted.csv\n")
+cat("- mediation_summary.csv\n")
+cat("- mediation_results_all_strata_boot5000.xlsx\n")
+cat("====================================================\n")

@@ -1,0 +1,1457 @@
+############################################################
+# Sensitivity Analyses
+#
+# This script performs sensitivity analyses for the association
+# between social exposome measures, epigenetic age acceleration
+# (EAA), and brain age gap (BAG).
+#
+# Analyses included:
+#   1. Models excluding diagnosis adjustment
+#   2. Sex-stratified analyses
+#   3. Clinical subgroup analyses
+#   4. Interaction analyses
+#   5. Matched sample analyses
+#
+# Matching analyses use 1:1 nearest-neighbor propensity score
+# matching for CN vs AD and CN vs FTD comparisons.
+############################################################
+
+# ------------------------------------------------------------
+# Packages
+# ------------------------------------------------------------
+
+required_packages <- c(
+  "readxl", "dplyr", "tidyr", "purrr", "broom", "tibble",
+  "stringr", "openxlsx", "writexl", "MatchIt", "cobalt",
+  "ggplot2", "svglite", "ragg"
+)
+
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(tibble)
+library(stringr)
+library(openxlsx)
+library(writexl)
+library(MatchIt)
+library(cobalt)
+library(ggplot2)
+library(svglite)
+library(ragg)
+
+# ------------------------------------------------------------
+# Project configuration
+# ------------------------------------------------------------
+
+project_dir <- "."
+
+input_file <- file.path(
+  project_dir,
+  "data",
+  "analysis_dataset.xlsx"
+)
+
+output_dir <- file.path(
+  project_dir,
+  "results",
+  "sensitivity_analyses"
+)
+
+interaction_output_dir <- file.path(output_dir, "interaction_analyses")
+matched_output_dir <- file.path(output_dir, "matched_sample_analyses")
+
+for (dir_i in c(output_dir, interaction_output_dir, matched_output_dir)) {
+  dir.create(dir_i, recursive = TRUE, showWarnings = FALSE)
+}
+
+file_type <- "xlsx"   # Options: "xlsx" or "csv"
+
+# ------------------------------------------------------------
+# Variable definitions
+# ------------------------------------------------------------
+
+var_age       <- "Decimal.Chronological.Age"
+var_sex       <- "demo_sex"
+var_smoking   <- "demo_smoke"
+var_site      <- "demo_resid"
+var_diagnosis <- "diagnosiscognormal"
+var_clinical  <- "clinical_diagnosis"
+
+# Social exposome measures
+
+global_social_vars <- c(
+  CSRI = "GPRI_reconstructed",
+  MSE  = "MSE_global_risk"
+)
+
+social_domain_vars <- c(
+  Education         = "GPRI_domain_education",
+  `Social support` = "GPRI_domain_social_support",
+  Adversities      = "GPRI_domain_adversities",
+  Socioeconomics   = "GPRI_domain_socioeconomic_conditions"
+)
+
+all_social_vars <- c(global_social_vars, social_domain_vars)
+
+# Epigenetic age acceleration measures
+
+eaa_vars <- c(
+  PhenoAge         = "EAA_PhenoAge",
+  Hannum           = "EAA_Hannum",
+  Horvath          = "EAA_Horvath",
+  DNAmFitAge       = "EAA_DNAmFitAge",
+  Blood            = "EAA_Blood",
+  Brain            = "EAA_Brain",
+  Heart            = "EAA_Heart",
+  Immune           = "EAA_Immune",
+  Inflammation     = "EAA_Inflammation",
+  Kidney           = "EAA_Kidney",
+  Liver            = "EAA_Liver",
+  Lung             = "EAA_Lung",
+  MusculoSkeletal  = "EAA_MusculoSkeletal",
+  OMICmAge         = "EAA_OMICmAge",
+  Retroclock       = "EAA_Retroclock",
+  Hormone          = "EAA_Hormone",
+  Metabolic        = "EAA_Metabolic",
+  SystemsAge       = "EAA_SystemsAge"
+)
+
+# Brain age gap measures
+
+bag_vars <- c(
+  `Functional BAG` = "BAG_funct",
+  `Structural BAG` = "BAG_structural"
+)
+
+# Country labels
+
+country_map <- c(
+  "1" = "Argentina",
+  "2" = "Brazil",
+  "3" = "Chile",
+  "4" = "Colombia",
+  "5" = "Mexico",
+  "6" = "Peru",
+  "7" = "United States",
+  "8" = "Other"
+)
+
+countries_for_interaction <- c(
+  "Argentina",
+  "Chile",
+  "Colombia",
+  "Mexico",
+  "Peru"
+)
+
+# Sex labels. Edit only if your dataset uses different coding.
+
+sex_map <- c(
+  "1" = "Male",
+  "2" = "Female",
+  "Male" = "Male",
+  "Female" = "Female",
+  "M" = "Male",
+  "F" = "Female",
+  "Hombre" = "Male",
+  "Mujer" = "Female"
+)
+
+# ------------------------------------------------------------
+# Data import
+# ------------------------------------------------------------
+
+if (file_type == "xlsx") {
+  dat_raw <- readxl::read_excel(input_file)
+} else if (file_type == "csv") {
+  dat_raw <- read.csv(input_file, stringsAsFactors = FALSE)
+} else {
+  stop("file_type must be either 'xlsx' or 'csv'.")
+}
+
+# ------------------------------------------------------------
+# Data preparation
+# ------------------------------------------------------------
+
+required_vars <- unique(c(
+  unname(all_social_vars),
+  unname(eaa_vars),
+  unname(bag_vars),
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis,
+  var_clinical
+))
+
+missing_vars <- setdiff(required_vars, names(dat_raw))
+
+if (length(missing_vars) > 0) {
+  cat("\nMissing variables:\n")
+  print(missing_vars)
+  stop("Update the variable definitions at the top of the script.")
+}
+
+dat <- dat_raw %>%
+  mutate(
+    across(all_of(c(unname(all_social_vars), unname(eaa_vars), unname(bag_vars), var_age)), as.numeric),
+    across(all_of(c(var_sex, var_smoking, var_site, var_diagnosis, var_clinical)), as.factor),
+    Sex_raw = as.character(.data[[var_sex]]),
+    Sex = recode(Sex_raw, !!!sex_map, .default = paste0("Sex_", Sex_raw)),
+    Sex = factor(Sex),
+    Site_raw = as.character(.data[[var_site]]),
+    Country = recode(Site_raw, !!!country_map, .default = Site_raw),
+    Country = factor(Country),
+    Diagnosis_raw = as.character(.data[[var_diagnosis]]),
+    Cognitive_status = case_when(
+      Diagnosis_raw %in% c("0", "Dementia", "dementia", "Case", "case") ~ "Dementia",
+      Diagnosis_raw %in% c("1", "Control", "control", "CN", "HC") ~ "Control",
+      TRUE ~ NA_character_
+    ),
+    Cognitive_status = factor(Cognitive_status, levels = c("Control", "Dementia")),
+    Clinical_diagnosis = as.character(.data[[var_clinical]]),
+    Clinical_diagnosis = recode(
+      Clinical_diagnosis,
+      "Control" = "CN",
+      "control" = "CN",
+      "HC" = "CN",
+      .default = Clinical_diagnosis
+    ),
+    Clinical_diagnosis = factor(Clinical_diagnosis, levels = c("CN", "AD", "FTD"))
+  )
+
+if ("Male" %in% levels(dat$Sex)) {
+  dat <- dat %>% mutate(Sex = relevel(Sex, ref = "Male"))
+}
+
+if ("Colombia" %in% levels(dat$Country)) {
+  dat <- dat %>% mutate(Country = relevel(Country, ref = "Colombia"))
+}
+
+cat("\nSex counts:\n")
+print(table(dat$Sex, useNA = "ifany"))
+cat("\nCognitive status counts:\n")
+print(table(dat$Cognitive_status, useNA = "ifany"))
+cat("\nClinical diagnosis counts:\n")
+print(table(dat$Clinical_diagnosis, useNA = "ifany"))
+cat("\nCountry counts:\n")
+print(table(dat$Country, useNA = "ifany"))
+
+# ------------------------------------------------------------
+# General helper functions
+# ------------------------------------------------------------
+
+format_p <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ "<0.001",
+    p < 0.01 ~ "<0.01",
+    p < 0.05 ~ "<0.05",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+format_ci <- function(low, high, digits = 3) {
+  dplyr::case_when(
+    is.na(low) | is.na(high) ~ NA_character_,
+    TRUE ~ paste0(
+      sprintf(paste0("%.", digits, "f"), low),
+      ", ",
+      sprintf(paste0("%.", digits, "f"), high)
+    )
+  )
+}
+
+safe_sd <- function(x) {
+  x_sd <- sd(x, na.rm = TRUE)
+  if (is.na(x_sd) || x_sd == 0) return(NA_real_)
+  x_sd
+}
+
+drop_bad_covars <- function(df, covars) {
+  covars_present <- intersect(covars, names(df))
+
+  keep <- purrr::map_lgl(
+    covars_present,
+    function(v) {
+      x <- df[[v]]
+      if (is.numeric(x)) return(sd(x, na.rm = TRUE) > 0)
+      if (is.factor(x) || is.character(x)) return(length(unique(na.omit(x))) > 1)
+      TRUE
+    }
+  )
+
+  covars_present[keep]
+}
+
+# ============================================================
+# 1. MODELS EXCLUDING DIAGNOSIS ADJUSTMENT
+# ============================================================
+
+# These models rerun the full-sample model families in which
+# diagnosis was included in the main analysis, removing diagnosis
+# from the covariate set.
+
+covars_eaa_no_diagnosis <- c(var_age, var_sex, var_smoking, var_site)
+covars_bag_eaa_no_diagnosis <- c(var_age, var_sex, var_smoking, var_site)
+
+fit_association_model <- function(data,
+                                  outcome_var,
+                                  predictor_var,
+                                  covariates,
+                                  analysis_name,
+                                  stratum_name,
+                                  outcome_label,
+                                  predictor_label) {
+
+  model_vars <- unique(c(outcome_var, predictor_var, covariates))
+
+  df <- data %>%
+    select(all_of(model_vars)) %>%
+    na.omit()
+
+  covariates <- drop_bad_covars(df, covariates)
+
+  empty_out <- tibble(
+    analysis = analysis_name,
+    stratum = stratum_name,
+    predictor = predictor_label,
+    outcome = outcome_label,
+    predictor_raw = predictor_var,
+    outcome_raw = outcome_var,
+    n = nrow(df),
+    beta = NA_real_,
+    ci_low = NA_real_,
+    ci_high = NA_real_,
+    beta_std = NA_real_,
+    ci_low_std = NA_real_,
+    ci_high_std = NA_real_,
+    p_value = NA_real_,
+    adj_r2 = NA_real_,
+    r2_full = NA_real_,
+    r2_reduced = NA_real_,
+    cohen_f2 = NA_real_,
+    covariates = paste(covariates, collapse = " + ")
+  )
+
+  if (nrow(df) < 20) return(empty_out)
+
+  full_formula_txt <- paste0(
+    outcome_var,
+    " ~ ",
+    predictor_var,
+    ifelse(length(covariates) > 0, paste0(" + ", paste(covariates, collapse = " + ")), "")
+  )
+
+  reduced_formula_txt <- paste0(
+    outcome_var,
+    " ~ ",
+    ifelse(length(covariates) > 0, paste(covariates, collapse = " + "), "1")
+  )
+
+  fit_full <- tryCatch(lm(as.formula(full_formula_txt), data = df), error = function(e) NULL)
+  fit_reduced <- tryCatch(lm(as.formula(reduced_formula_txt), data = df), error = function(e) NULL)
+
+  if (is.null(fit_full) || is.null(fit_reduced)) return(empty_out)
+
+  term_row <- broom::tidy(fit_full, conf.int = TRUE) %>%
+    filter(term == predictor_var)
+
+  if (nrow(term_row) != 1) return(empty_out)
+
+  sd_x <- safe_sd(df[[predictor_var]])
+  sd_y <- safe_sd(df[[outcome_var]])
+  std_factor <- ifelse(is.na(sd_x) || is.na(sd_y), NA_real_, sd_x / sd_y)
+
+  r2_full <- summary(fit_full)$r.squared
+  r2_reduced <- summary(fit_reduced)$r.squared
+  cohen_f2 <- (r2_full - r2_reduced) / (1 - r2_full)
+
+  tibble(
+    analysis = analysis_name,
+    stratum = stratum_name,
+    predictor = predictor_label,
+    outcome = outcome_label,
+    predictor_raw = predictor_var,
+    outcome_raw = outcome_var,
+    n = nrow(df),
+    beta = term_row$estimate,
+    ci_low = term_row$conf.low,
+    ci_high = term_row$conf.high,
+    beta_std = term_row$estimate * std_factor,
+    ci_low_std = term_row$conf.low * std_factor,
+    ci_high_std = term_row$conf.high * std_factor,
+    p_value = term_row$p.value,
+    adj_r2 = summary(fit_full)$adj.r.squared,
+    r2_full = r2_full,
+    r2_reduced = r2_reduced,
+    cohen_f2 = cohen_f2,
+    covariates = paste(covariates, collapse = " + ")
+  )
+}
+
+run_model_grid <- function(data,
+                           outcomes,
+                           predictors,
+                           covariates,
+                           analysis_name,
+                           stratum_name) {
+
+  tidyr::crossing(
+    outcome_label = names(outcomes),
+    predictor_label = names(predictors)
+  ) %>%
+    pmap_dfr(
+      function(outcome_label, predictor_label) {
+        fit_association_model(
+          data = data,
+          outcome_var = outcomes[[outcome_label]],
+          predictor_var = predictors[[predictor_label]],
+          covariates = covariates,
+          analysis_name = analysis_name,
+          stratum_name = stratum_name,
+          outcome_label = outcome_label,
+          predictor_label = predictor_label
+        )
+      }
+    ) %>%
+    group_by(analysis, stratum, outcome) %>%
+    mutate(FDR_by_outcome = p.adjust(p_value, method = "fdr")) %>%
+    ungroup() %>%
+    group_by(analysis, stratum) %>%
+    mutate(FDR_global = p.adjust(p_value, method = "fdr")) %>%
+    ungroup()
+}
+
+format_association_results <- function(df) {
+  df %>%
+    mutate(
+      beta_std = round(beta_std, 3),
+      ci_low_std = round(ci_low_std, 3),
+      ci_high_std = round(ci_high_std, 3),
+      `95_CI_std` = paste0("[", ci_low_std, ", ", ci_high_std, "]"),
+      p_value = format_p(p_value),
+      FDR_by_outcome = format_p(FDR_by_outcome),
+      FDR_global = format_p(FDR_global),
+      adj_r2 = round(adj_r2, 3),
+      cohen_f2 = round(cohen_f2, 3)
+    ) %>%
+    select(
+      analysis,
+      stratum,
+      predictor,
+      outcome,
+      beta_std,
+      `95_CI_std`,
+      p_value,
+      FDR_by_outcome,
+      FDR_global,
+      adj_r2,
+      cohen_f2,
+      n,
+      covariates,
+      predictor_raw,
+      outcome_raw
+    )
+}
+
+no_diagnosis_results <- bind_rows(
+  run_model_grid(
+    data = dat,
+    outcomes = eaa_vars,
+    predictors = global_social_vars,
+    covariates = covars_eaa_no_diagnosis,
+    analysis_name = "no_diagnosis_global_social_to_EAA",
+    stratum_name = "Full sample"
+  ),
+  run_model_grid(
+    data = dat,
+    outcomes = eaa_vars,
+    predictors = social_domain_vars,
+    covariates = covars_eaa_no_diagnosis,
+    analysis_name = "no_diagnosis_social_domains_to_EAA",
+    stratum_name = "Full sample"
+  ),
+  run_model_grid(
+    data = dat,
+    outcomes = bag_vars,
+    predictors = eaa_vars,
+    covariates = covars_bag_eaa_no_diagnosis,
+    analysis_name = "no_diagnosis_EAA_to_BAG",
+    stratum_name = "Full sample"
+  )
+)
+
+# ============================================================
+# 2. SEX-STRATIFIED ANALYSES
+# ============================================================
+
+sex_covars_eaa <- c(var_age, var_smoking, var_site, var_diagnosis)
+sex_covars_bag_social <- c(var_age, var_smoking)
+sex_covars_bag_eaa <- c(var_age, var_smoking, var_site, var_diagnosis)
+
+sex_analysis_specs <- list(
+  sex_global_social_to_EAA = list(outcomes = eaa_vars, predictors = global_social_vars, covariates = sex_covars_eaa),
+  sex_social_domains_to_EAA = list(outcomes = eaa_vars, predictors = social_domain_vars, covariates = sex_covars_eaa),
+  sex_global_social_to_BAG = list(outcomes = bag_vars, predictors = global_social_vars, covariates = sex_covars_bag_social),
+  sex_social_domains_to_BAG = list(outcomes = bag_vars, predictors = social_domain_vars, covariates = sex_covars_bag_social),
+  sex_EAA_to_BAG = list(outcomes = bag_vars, predictors = eaa_vars, covariates = sex_covars_bag_eaa)
+)
+
+sex_stratified_results <- map_dfr(
+  c("Male", "Female"),
+  function(sex_i) {
+    dat_i <- dat %>% filter(Sex == sex_i)
+
+    map_dfr(
+      names(sex_analysis_specs),
+      function(analysis_i) {
+        spec <- sex_analysis_specs[[analysis_i]]
+
+        run_model_grid(
+          data = dat_i,
+          outcomes = spec$outcomes,
+          predictors = spec$predictors,
+          covariates = spec$covariates,
+          analysis_name = analysis_i,
+          stratum_name = sex_i
+        )
+      }
+    )
+  }
+)
+
+# ============================================================
+# 3. CLINICAL SUBGROUP ANALYSES
+# ============================================================
+
+clinical_covars_eaa <- c(var_age, var_sex, var_smoking, var_site)
+clinical_covars_bag_social <- c(var_age, var_sex, var_smoking)
+clinical_covars_bag_eaa <- c(var_age, var_sex, var_smoking, var_site)
+
+clinical_analysis_specs <- list(
+  clinical_global_social_to_EAA = list(outcomes = eaa_vars, predictors = global_social_vars, covariates = clinical_covars_eaa),
+  clinical_social_domains_to_EAA = list(outcomes = eaa_vars, predictors = social_domain_vars, covariates = clinical_covars_eaa),
+  clinical_global_social_to_BAG = list(outcomes = bag_vars, predictors = global_social_vars, covariates = clinical_covars_bag_social),
+  clinical_social_domains_to_BAG = list(outcomes = bag_vars, predictors = social_domain_vars, covariates = clinical_covars_bag_social),
+  clinical_EAA_to_BAG = list(outcomes = bag_vars, predictors = eaa_vars, covariates = clinical_covars_bag_eaa)
+)
+
+make_clinical_subset <- function(data, subgroup) {
+  if (subgroup == "Control") return(data %>% filter(Cognitive_status == "Control"))
+  if (subgroup == "Dementia") return(data %>% filter(Cognitive_status == "Dementia"))
+  if (subgroup == "HC") return(data %>% filter(Clinical_diagnosis == "CN"))
+  if (subgroup == "AD") return(data %>% filter(Clinical_diagnosis == "AD"))
+  if (subgroup == "FTD") return(data %>% filter(Clinical_diagnosis == "FTD"))
+  stop("Unknown clinical subgroup: ", subgroup)
+}
+
+clinical_subgroup_results <- map_dfr(
+  c("Control", "Dementia", "HC", "AD", "FTD"),
+  function(group_i) {
+    dat_i <- make_clinical_subset(dat, group_i)
+
+    map_dfr(
+      names(clinical_analysis_specs),
+      function(analysis_i) {
+        spec <- clinical_analysis_specs[[analysis_i]]
+
+        run_model_grid(
+          data = dat_i,
+          outcomes = spec$outcomes,
+          predictors = spec$predictors,
+          covariates = spec$covariates,
+          analysis_name = analysis_i,
+          stratum_name = group_i
+        )
+      }
+    )
+  }
+)
+
+all_association_sensitivity <- bind_rows(
+  no_diagnosis_results,
+  sex_stratified_results,
+  clinical_subgroup_results
+)
+
+write.csv(
+  all_association_sensitivity,
+  file.path(output_dir, "association_sensitivity_results_raw.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  format_association_results(all_association_sensitivity),
+  file.path(output_dir, "association_sensitivity_results_formatted.csv"),
+  row.names = FALSE
+)
+
+wb_sens <- createWorkbook()
+
+add_sensitivity_sheet <- function(wb, sheet_name, df) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, df)
+  setColWidths(wb, sheet_name, cols = 1:ncol(df), widths = "auto")
+}
+
+add_sensitivity_sheet(wb_sens, "All_raw", all_association_sensitivity)
+add_sensitivity_sheet(wb_sens, "All_formatted", format_association_results(all_association_sensitivity))
+add_sensitivity_sheet(wb_sens, "No_diagnosis", format_association_results(no_diagnosis_results))
+add_sensitivity_sheet(wb_sens, "Sex_stratified", format_association_results(sex_stratified_results))
+add_sensitivity_sheet(wb_sens, "Clinical_subgroups", format_association_results(clinical_subgroup_results))
+
+saveWorkbook(
+  wb_sens,
+  file.path(output_dir, "association_sensitivity_results.xlsx"),
+  overwrite = TRUE
+)
+
+# ============================================================
+# 4. INTERACTION ANALYSES
+# ============================================================
+
+moderator_label <- function(moderator) {
+  case_when(
+    moderator == "Cognitive_status" ~ "Cognitive status",
+    moderator == "Clinical_diagnosis" ~ "Clinical diagnosis",
+    moderator == "Sex" ~ "Sex",
+    moderator == "Country" ~ "Country",
+    moderator == var_age ~ "Age",
+    moderator == "MSE_global_risk" ~ "MSE",
+    TRUE ~ moderator
+  )
+}
+
+is_continuous_moderator <- function(moderator) {
+  moderator %in% c(var_age, "MSE_global_risk")
+}
+
+run_interaction_model_std <- function(data,
+                                      outcome,
+                                      exposure,
+                                      moderator,
+                                      covariates,
+                                      block,
+                                      analysis_label,
+                                      exposure_label,
+                                      outcome_label) {
+
+  moderator_label_i <- moderator_label(moderator)
+  vars_model <- unique(c(outcome, exposure, moderator, covariates))
+
+  df <- data %>%
+    select(all_of(vars_model)) %>%
+    na.omit()
+
+  empty_global <- tibble(
+    block = block,
+    analysis = analysis_label,
+    exposure = exposure_label,
+    moderator = moderator_label_i,
+    outcome = outcome_label,
+    global_interaction_F = NA_real_,
+    global_interaction_df = NA_real_,
+    global_interaction_p = NA_real_,
+    adj_r2_full = NA_real_,
+    n = nrow(df)
+  )
+
+  empty_coef <- tibble(
+    block = block,
+    analysis = analysis_label,
+    exposure = exposure_label,
+    moderator = moderator_label_i,
+    outcome = outcome_label,
+    term = NA_character_,
+    interaction_contrast = NA_character_,
+    beta_std = NA_real_,
+    ci_low_std = NA_real_,
+    ci_high_std = NA_real_,
+    p_value = NA_real_,
+    adj_r2_full = NA_real_,
+    n = nrow(df)
+  )
+
+  empty_slope <- tibble(
+    block = block,
+    analysis = analysis_label,
+    exposure = exposure_label,
+    moderator = moderator_label_i,
+    outcome = outcome_label,
+    simple_slope_level = NA_character_,
+    beta_std = NA_real_,
+    ci_low_std = NA_real_,
+    ci_high_std = NA_real_,
+    p_value = NA_real_,
+    n = nrow(df)
+  )
+
+  if (nrow(df) < 30) {
+    return(list(global = empty_global, coefficients = empty_coef, simple_slopes = empty_slope))
+  }
+
+  df <- df %>%
+    mutate(
+      y_z = as.numeric(scale(.data[[outcome]])),
+      x_z = as.numeric(scale(.data[[exposure]]))
+    )
+
+  covariates <- setdiff(covariates, c(exposure, moderator))
+  covariates <- drop_bad_covars(df, covariates)
+
+  if (is_continuous_moderator(moderator)) {
+
+    df <- df %>% mutate(mod_z = as.numeric(scale(.data[[moderator]])))
+
+    full_formula <- as.formula(paste0(
+      "y_z ~ x_z * mod_z",
+      ifelse(length(covariates) > 0, paste0(" + ", paste(covariates, collapse = " + ")), "")
+    ))
+
+    reduced_formula <- as.formula(paste0(
+      "y_z ~ x_z + mod_z",
+      ifelse(length(covariates) > 0, paste0(" + ", paste(covariates, collapse = " + ")), "")
+    ))
+
+    fit_full <- tryCatch(lm(full_formula, data = df), error = function(e) NULL)
+    fit_reduced <- tryCatch(lm(reduced_formula, data = df), error = function(e) NULL)
+
+    if (is.null(fit_full) || is.null(fit_reduced)) {
+      return(list(global = empty_global, coefficients = empty_coef, simple_slopes = empty_slope))
+    }
+
+    anova_out <- tryCatch(anova(fit_reduced, fit_full), error = function(e) NULL)
+
+    global_out <- empty_global %>%
+      mutate(
+        global_interaction_F = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$F[2]), NA_real_),
+        global_interaction_df = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$Df[2]), NA_real_),
+        global_interaction_p = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$`Pr(>F)`[2]), NA_real_),
+        adj_r2_full = as.numeric(summary(fit_full)$adj.r.squared),
+        n = nrow(df)
+      )
+
+    coef_out <- broom::tidy(fit_full, conf.int = TRUE) %>%
+      filter(term == "x_z:mod_z") %>%
+      transmute(
+        block = block,
+        analysis = analysis_label,
+        exposure = exposure_label,
+        moderator = moderator_label_i,
+        outcome = outcome_label,
+        term,
+        interaction_contrast = paste0(exposure_label, " x ", moderator_label_i),
+        beta_std = estimate,
+        ci_low_std = conf.low,
+        ci_high_std = conf.high,
+        p_value = p.value,
+        adj_r2_full = as.numeric(summary(fit_full)$adj.r.squared),
+        n = nrow(df)
+      )
+
+    if (nrow(coef_out) == 0) coef_out <- empty_coef
+
+    coefs <- coef(fit_full)
+    vc <- vcov(fit_full)
+
+    if (all(c("x_z", "x_z:mod_z") %in% names(coefs))) {
+      simple_slopes_out <- tibble(
+        mod_value = c(-1, 0, 1),
+        simple_slope_level = c(
+          paste0(moderator_label_i, " low (-1 SD)"),
+          paste0(moderator_label_i, " mean"),
+          paste0(moderator_label_i, " high (+1 SD)")
+        )
+      ) %>%
+        rowwise() %>%
+        mutate(
+          beta_std = coefs["x_z"] + coefs["x_z:mod_z"] * mod_value,
+          se = sqrt(
+            vc["x_z", "x_z"] +
+              mod_value^2 * vc["x_z:mod_z", "x_z:mod_z"] +
+              2 * mod_value * vc["x_z", "x_z:mod_z"]
+          ),
+          t_value = beta_std / se,
+          df_resid = df.residual(fit_full),
+          p_value = 2 * pt(abs(t_value), df = df_resid, lower.tail = FALSE),
+          ci_low_std = beta_std - qt(0.975, df = df_resid) * se,
+          ci_high_std = beta_std + qt(0.975, df = df_resid) * se
+        ) %>%
+        ungroup() %>%
+        transmute(
+          block = block,
+          analysis = analysis_label,
+          exposure = exposure_label,
+          moderator = moderator_label_i,
+          outcome = outcome_label,
+          simple_slope_level,
+          beta_std,
+          ci_low_std,
+          ci_high_std,
+          p_value,
+          n = nrow(df)
+        )
+    } else {
+      simple_slopes_out <- empty_slope
+    }
+
+    return(list(global = global_out, coefficients = coef_out, simple_slopes = simple_slopes_out))
+  }
+
+  df <- df %>% mutate(mod_fac = droplevels(as.factor(.data[[moderator]])))
+
+  if (nlevels(df$mod_fac) < 2) {
+    return(list(global = empty_global, coefficients = empty_coef, simple_slopes = empty_slope))
+  }
+
+  ref_level <- levels(df$mod_fac)[1]
+
+  full_formula <- as.formula(paste0(
+    "y_z ~ x_z * mod_fac",
+    ifelse(length(covariates) > 0, paste0(" + ", paste(covariates, collapse = " + ")), "")
+  ))
+
+  reduced_formula <- as.formula(paste0(
+    "y_z ~ x_z + mod_fac",
+    ifelse(length(covariates) > 0, paste0(" + ", paste(covariates, collapse = " + ")), "")
+  ))
+
+  fit_full <- tryCatch(lm(full_formula, data = df), error = function(e) NULL)
+  fit_reduced <- tryCatch(lm(reduced_formula, data = df), error = function(e) NULL)
+
+  if (is.null(fit_full) || is.null(fit_reduced)) {
+    return(list(global = empty_global, coefficients = empty_coef, simple_slopes = empty_slope))
+  }
+
+  anova_out <- tryCatch(anova(fit_reduced, fit_full), error = function(e) NULL)
+
+  global_out <- empty_global %>%
+    mutate(
+      global_interaction_F = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$F[2]), NA_real_),
+      global_interaction_df = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$Df[2]), NA_real_),
+      global_interaction_p = ifelse(!is.null(anova_out) && nrow(anova_out) >= 2, as.numeric(anova_out$`Pr(>F)`[2]), NA_real_),
+      adj_r2_full = as.numeric(summary(fit_full)$adj.r.squared),
+      n = nrow(df)
+    )
+
+  coef_out <- broom::tidy(fit_full, conf.int = TRUE) %>%
+    filter(str_detect(term, ":"), str_detect(term, "x_z"), str_detect(term, "mod_fac")) %>%
+    transmute(
+      block = block,
+      analysis = analysis_label,
+      exposure = exposure_label,
+      moderator = moderator_label_i,
+      outcome = outcome_label,
+      term,
+      interaction_contrast = paste0(exposure_label, " x ", str_replace(term, "x_z:mod_fac|mod_fac:x_z", ""), " vs ", ref_level),
+      beta_std = estimate,
+      ci_low_std = conf.low,
+      ci_high_std = conf.high,
+      p_value = p.value,
+      adj_r2_full = as.numeric(summary(fit_full)$adj.r.squared),
+      n = nrow(df)
+    )
+
+  if (nrow(coef_out) == 0) coef_out <- empty_coef
+
+  simple_slopes_out <- map_dfr(
+    levels(df$mod_fac),
+    function(level_i) {
+      df_i <- df %>% filter(mod_fac == level_i) %>% droplevels()
+      covars_i <- drop_bad_covars(df_i, covariates)
+
+      if (nrow(df_i) < 20) {
+        return(empty_slope %>% mutate(simple_slope_level = level_i, n = nrow(df_i)))
+      }
+
+      slope_formula <- as.formula(paste0(
+        "y_z ~ x_z",
+        ifelse(length(covars_i) > 0, paste0(" + ", paste(covars_i, collapse = " + ")), "")
+      ))
+
+      fit_slope <- tryCatch(lm(slope_formula, data = df_i), error = function(e) NULL)
+
+      if (is.null(fit_slope)) {
+        return(empty_slope %>% mutate(simple_slope_level = level_i, n = nrow(df_i)))
+      }
+
+      broom::tidy(fit_slope, conf.int = TRUE) %>%
+        filter(term == "x_z") %>%
+        transmute(
+          block = block,
+          analysis = analysis_label,
+          exposure = exposure_label,
+          moderator = moderator_label_i,
+          outcome = outcome_label,
+          simple_slope_level = level_i,
+          beta_std = estimate,
+          ci_low_std = conf.low,
+          ci_high_std = conf.high,
+          p_value = p.value,
+          n = nrow(df_i)
+        )
+    }
+  )
+
+  list(global = global_out, coefficients = coef_out, simple_slopes = simple_slopes_out)
+}
+
+run_interaction_grid_std <- function(data,
+                                     exposures,
+                                     moderator,
+                                     covariates,
+                                     block,
+                                     analysis_label) {
+  res <- imap(
+    exposures,
+    function(exp_var, exp_label) {
+      imap(
+        eaa_vars,
+        function(out_var, out_label) {
+          run_interaction_model_std(
+            data = data,
+            outcome = out_var,
+            exposure = exp_var,
+            moderator = moderator,
+            covariates = covariates,
+            block = block,
+            analysis_label = analysis_label,
+            exposure_label = exp_label,
+            outcome_label = out_label
+          )
+        }
+      )
+    }
+  ) %>%
+    flatten() %>%
+    compact()
+
+  list(
+    global = map_dfr(res, "global"),
+    coefficients = map_dfr(res, "coefficients"),
+    simple_slopes = map_dfr(res, "simple_slopes")
+  )
+}
+
+interaction_blocks <- list(
+  run_interaction_grid_std(
+    data = dat,
+    exposures = all_social_vars,
+    moderator = "Cognitive_status",
+    covariates = c(var_sex, var_smoking, var_site, var_age),
+    block = "1. Social exposure x cognitive status",
+    analysis_label = "Effect modification by cognitive status"
+  ),
+  run_interaction_grid_std(
+    data = dat %>% filter(Clinical_diagnosis %in% c("CN", "AD", "FTD")) %>% droplevels(),
+    exposures = all_social_vars,
+    moderator = "Clinical_diagnosis",
+    covariates = c(var_sex, var_smoking, var_site, var_age),
+    block = "2. Social exposure x clinical diagnosis",
+    analysis_label = "Effect modification by clinical diagnosis"
+  ),
+  run_interaction_grid_std(
+    data = dat,
+    exposures = all_social_vars,
+    moderator = "Sex",
+    covariates = c(var_smoking, var_site, var_age, "Cognitive_status"),
+    block = "3. Social exposure x sex",
+    analysis_label = "Effect modification by sex"
+  ),
+  run_interaction_grid_std(
+    data = dat %>% filter(Country %in% countries_for_interaction) %>% droplevels(),
+    exposures = all_social_vars,
+    moderator = "Country",
+    covariates = c(var_sex, var_smoking, var_age, "Cognitive_status"),
+    block = "4. Social exposure x country",
+    analysis_label = "Effect modification by country"
+  ),
+  run_interaction_grid_std(
+    data = dat,
+    exposures = all_social_vars,
+    moderator = var_age,
+    covariates = c(var_sex, var_smoking, var_site, "Cognitive_status"),
+    block = "5. Social exposure x chronological age",
+    analysis_label = "Effect modification by age"
+  ),
+  run_interaction_grid_std(
+    data = dat,
+    exposures = c(CSRI = "GPRI_reconstructed"),
+    moderator = "MSE_global_risk",
+    covariates = c(var_sex, var_smoking, var_site, var_age, "Cognitive_status"),
+    block = "6. CSRI x MSE",
+    analysis_label = "Interaction between CSRI and MSE"
+  )
+)
+
+global_interaction_tests <- map_dfr(interaction_blocks, "global") %>%
+  group_by(block, exposure) %>%
+  mutate(global_interaction_FDR = p.adjust(global_interaction_p, method = "fdr")) %>%
+  ungroup()
+
+interaction_coefficients <- map_dfr(interaction_blocks, "coefficients") %>%
+  group_by(block, exposure, moderator) %>%
+  mutate(coefficient_FDR = p.adjust(p_value, method = "fdr")) %>%
+  ungroup()
+
+simple_slopes <- map_dfr(interaction_blocks, "simple_slopes") %>%
+  group_by(block, exposure, moderator, simple_slope_level) %>%
+  mutate(simple_slope_FDR = p.adjust(p_value, method = "fdr")) %>%
+  ungroup()
+
+global_interaction_tests_formatted <- global_interaction_tests %>%
+  mutate(
+    global_interaction_F = round(global_interaction_F, 2),
+    global_interaction_p = format_p(global_interaction_p),
+    global_interaction_FDR = format_p(global_interaction_FDR),
+    adj_r2_full = round(adj_r2_full, 3)
+  )
+
+interaction_coefficients_formatted <- interaction_coefficients %>%
+  mutate(
+    beta_std = round(beta_std, 3),
+    `95_CI_std` = format_ci(ci_low_std, ci_high_std, digits = 3),
+    p_value = format_p(p_value),
+    coefficient_FDR = format_p(coefficient_FDR),
+    adj_r2_full = round(adj_r2_full, 3)
+  )
+
+simple_slopes_formatted <- simple_slopes %>%
+  mutate(
+    beta_std = round(beta_std, 3),
+    `95_CI_std` = format_ci(ci_low_std, ci_high_std, digits = 3),
+    p_value = format_p(p_value),
+    simple_slope_FDR = format_p(simple_slope_FDR)
+  )
+
+writexl::write_xlsx(
+  list(
+    Global_tests = global_interaction_tests_formatted,
+    Coefficients = interaction_coefficients_formatted,
+    Simple_slopes = simple_slopes_formatted,
+    Raw_global_tests = global_interaction_tests,
+    Raw_coefficients = interaction_coefficients,
+    Raw_simple_slopes = simple_slopes
+  ),
+  file.path(interaction_output_dir, "interaction_sensitivity_results.xlsx")
+)
+
+write.csv(global_interaction_tests, file.path(interaction_output_dir, "interaction_global_tests_raw.csv"), row.names = FALSE)
+write.csv(interaction_coefficients, file.path(interaction_output_dir, "interaction_coefficients_raw.csv"), row.names = FALSE)
+write.csv(simple_slopes, file.path(interaction_output_dir, "interaction_simple_slopes_raw.csv"), row.names = FALSE)
+
+# ============================================================
+# 5. MATCHED SAMPLE ANALYSES
+# ============================================================
+
+matching_strategies <- list(
+  Model_A_age_sex = c(var_age, var_sex),
+  Model_B_age_sex_site = c(var_age, var_sex, var_site),
+  Model_C_age_sex_site_smoking = c(var_age, var_sex, var_site, var_smoking)
+)
+
+matching_comparisons <- list(
+  CN_vs_AD = c("CN", "AD"),
+  CN_vs_FTD = c("CN", "FTD")
+)
+
+make_matched_descriptives <- function(df, group_var = "treat") {
+  df %>%
+    group_by(.data[[group_var]]) %>%
+    summarise(
+      N = n(),
+      age_mean = mean(.data[[var_age]], na.rm = TRUE),
+      age_sd = sd(.data[[var_age]], na.rm = TRUE),
+      female_n = sum(as.character(.data[[var_sex]]) %in% c("2", "Female", "F"), na.rm = TRUE),
+      female_pct = 100 * female_n / N,
+      smoking_available = sum(!is.na(.data[[var_smoking]])),
+      sites = paste(names(sort(table(.data[[var_site]]), decreasing = TRUE)), collapse = "; "),
+      .groups = "drop"
+    )
+}
+
+run_matched_regression_grid <- function(df, comparison_name, strategy_name, sample_type) {
+  covars_model <- c(var_sex, var_smoking, var_site, var_age)
+  outcomes <- c(eaa_vars, bag_vars)
+
+  map_dfr(
+    all_social_vars,
+    function(exp_var) {
+      map_dfr(
+        outcomes,
+        function(outcome_var) {
+          vars_model <- unique(c(outcome_var, exp_var, covars_model))
+
+          dat_i <- df %>%
+            select(all_of(vars_model)) %>%
+            na.omit()
+
+          covars_i <- drop_bad_covars(dat_i, covars_model)
+
+          empty <- tibble(
+            comparison = comparison_name,
+            matching_strategy = strategy_name,
+            sample = sample_type,
+            exposure = names(all_social_vars)[all_social_vars == exp_var][1],
+            outcome = names(outcomes)[outcomes == outcome_var][1],
+            beta = NA_real_,
+            ci_low = NA_real_,
+            ci_high = NA_real_,
+            beta_std = NA_real_,
+            ci_low_std = NA_real_,
+            ci_high_std = NA_real_,
+            p_value = NA_real_,
+            F_statistic = NA_real_,
+            adj_r2 = NA_real_,
+            n = nrow(dat_i)
+          )
+
+          if (nrow(dat_i) < 20) return(empty)
+
+          formula_txt <- paste0(
+            outcome_var,
+            " ~ ",
+            exp_var,
+            ifelse(length(covars_i) > 0, paste0(" + ", paste(covars_i, collapse = " + ")), "")
+          )
+
+          fit <- tryCatch(lm(as.formula(formula_txt), data = dat_i), error = function(e) NULL)
+          if (is.null(fit)) return(empty)
+
+          est <- broom::tidy(fit, conf.int = TRUE) %>%
+            filter(term == exp_var)
+
+          if (nrow(est) != 1) return(empty)
+
+          sd_x <- safe_sd(dat_i[[exp_var]])
+          sd_y <- safe_sd(dat_i[[outcome_var]])
+          std_factor <- ifelse(is.na(sd_x) || is.na(sd_y), NA_real_, sd_x / sd_y)
+
+          tibble(
+            comparison = comparison_name,
+            matching_strategy = strategy_name,
+            sample = sample_type,
+            exposure = names(all_social_vars)[all_social_vars == exp_var][1],
+            outcome = names(outcomes)[outcomes == outcome_var][1],
+            beta = est$estimate,
+            ci_low = est$conf.low,
+            ci_high = est$conf.high,
+            beta_std = est$estimate * std_factor,
+            ci_low_std = est$conf.low * std_factor,
+            ci_high_std = est$conf.high * std_factor,
+            p_value = est$p.value,
+            F_statistic = as.numeric(summary(fit)$fstatistic[1]),
+            adj_r2 = as.numeric(summary(fit)$adj.r.squared),
+            n = nrow(dat_i)
+          )
+        }
+      )
+    }
+  )
+}
+
+run_matching_analysis <- function(comparison_name, groups, strategy_name, match_covariates) {
+  message("Running matched analysis: ", comparison_name, " / ", strategy_name)
+
+  control_group <- groups[1]
+  patient_group <- groups[2]
+
+  dat_comp <- dat %>%
+    filter(Clinical_diagnosis %in% groups) %>%
+    mutate(treat = ifelse(Clinical_diagnosis == patient_group, 1, 0))
+
+  n_before <- nrow(dat_comp)
+
+  dat_match <- dat_comp %>%
+    filter(complete.cases(select(., all_of(c("treat", match_covariates)))))
+
+  if (nrow(dat_match) < 20 || length(unique(dat_match$treat)) < 2) {
+    empty_summary <- tibble(
+      comparison = comparison_name,
+      matching_strategy = strategy_name,
+      control_group = control_group,
+      patient_group = patient_group,
+      n_before = n_before,
+      n_after = NA_integer_,
+      n_discarded = NA_integer_,
+      matched_controls = NA_integer_,
+      matched_patients = NA_integer_,
+      max_abs_smd_after = NA_real_,
+      mean_abs_smd_after = NA_real_,
+      note = "Insufficient data for matching"
+    )
+
+    return(list(
+      summary = empty_summary,
+      balance = tibble(),
+      descriptives = tibble(),
+      regressions = tibble()
+    ))
+  }
+
+  formula_match <- as.formula(
+    paste0("treat ~ ", paste(match_covariates, collapse = " + "))
+  )
+
+  match_object <- tryCatch(
+    MatchIt::matchit(
+      formula = formula_match,
+      data = dat_match,
+      method = "nearest",
+      distance = "glm",
+      ratio = 1,
+      replace = FALSE,
+      caliper = 0.2,
+      std.caliper = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(match_object)) {
+    empty_summary <- tibble(
+      comparison = comparison_name,
+      matching_strategy = strategy_name,
+      control_group = control_group,
+      patient_group = patient_group,
+      n_before = n_before,
+      n_after = NA_integer_,
+      n_discarded = NA_integer_,
+      matched_controls = NA_integer_,
+      matched_patients = NA_integer_,
+      max_abs_smd_after = NA_real_,
+      mean_abs_smd_after = NA_real_,
+      note = "Matching failed"
+    )
+
+    return(list(
+      summary = empty_summary,
+      balance = tibble(),
+      descriptives = tibble(),
+      regressions = tibble()
+    ))
+  }
+
+  matched <- MatchIt::match.data(match_object)
+  n_after <- nrow(matched)
+
+  balance_object <- cobalt::bal.tab(
+    match_object,
+    un = TRUE,
+    m.threshold = 0.10,
+    v.threshold = 2
+  )
+
+  balance_df <- as.data.frame(balance_object$Balance) %>%
+    tibble::rownames_to_column("covariate") %>%
+    mutate(
+      comparison = comparison_name,
+      matching_strategy = strategy_name,
+      n_before = n_before,
+      n_after = n_after,
+      n_discarded = n_before - n_after
+    )
+
+  smd_col <- if ("Diff.Adj" %in% names(balance_df)) "Diff.Adj" else names(balance_df)[str_detect(names(balance_df), "Diff")][1]
+
+  summary_df <- tibble(
+    comparison = comparison_name,
+    matching_strategy = strategy_name,
+    control_group = control_group,
+    patient_group = patient_group,
+    n_before = n_before,
+    n_after = n_after,
+    n_discarded = n_before - n_after,
+    matched_controls = sum(matched$treat == 0),
+    matched_patients = sum(matched$treat == 1),
+    max_abs_smd_after = ifelse(!is.na(smd_col), max(abs(balance_df[[smd_col]]), na.rm = TRUE), NA_real_),
+    mean_abs_smd_after = ifelse(!is.na(smd_col), mean(abs(balance_df[[smd_col]]), na.rm = TRUE), NA_real_),
+    note = NA_character_
+  )
+
+  desc_pre <- make_matched_descriptives(dat_match, "treat") %>%
+    mutate(comparison = comparison_name, matching_strategy = strategy_name, stage = "Pre-matching")
+
+  desc_post <- make_matched_descriptives(matched, "treat") %>%
+    mutate(comparison = comparison_name, matching_strategy = strategy_name, stage = "Post-matching")
+
+  love_plot <- cobalt::love.plot(
+    match_object,
+    stats = "mean.diffs",
+    abs = TRUE,
+    thresholds = c(m = 0.10),
+    var.order = "unadjusted"
+  ) +
+    ggtitle(paste0(comparison_name, " - ", strategy_name)) +
+    theme_classic(base_family = "Arial", base_size = 9)
+
+  ggsave(
+    file.path(matched_output_dir, paste0("loveplot_", comparison_name, "_", strategy_name, ".svg")),
+    love_plot,
+    width = 150,
+    height = 100,
+    units = "mm",
+    device = svglite::svglite
+  )
+
+  ggsave(
+    file.path(matched_output_dir, paste0("loveplot_", comparison_name, "_", strategy_name, ".png")),
+    love_plot,
+    width = 150,
+    height = 100,
+    units = "mm",
+    dpi = 600,
+    device = ragg::agg_png,
+    bg = "white"
+  )
+
+  ps_df <- bind_rows(
+    dat_match %>% mutate(stage = "Pre-matching", distance = match_object$distance),
+    matched %>% mutate(stage = "Post-matching")
+  )
+
+  ps_plot <- ggplot(ps_df, aes(x = distance, fill = factor(treat))) +
+    geom_density(alpha = 0.35, colour = NA) +
+    facet_wrap(~ stage, ncol = 1) +
+    labs(
+      title = paste0("Propensity score distribution - ", comparison_name, " - ", strategy_name),
+      x = "Propensity score",
+      y = "Density",
+      fill = NULL
+    ) +
+    theme_classic(base_family = "Arial", base_size = 9) +
+    theme(legend.position = "top")
+
+  ggsave(
+    file.path(matched_output_dir, paste0("ps_distribution_", comparison_name, "_", strategy_name, ".svg")),
+    ps_plot,
+    width = 150,
+    height = 110,
+    units = "mm",
+    device = svglite::svglite
+  )
+
+  ggsave(
+    file.path(matched_output_dir, paste0("ps_distribution_", comparison_name, "_", strategy_name, ".png")),
+    ps_plot,
+    width = 150,
+    height = 110,
+    units = "mm",
+    dpi = 600,
+    device = ragg::agg_png,
+    bg = "white"
+  )
+
+  regressions <- bind_rows(
+    run_matched_regression_grid(dat_comp, comparison_name, strategy_name, "Full unmatched sample"),
+    run_matched_regression_grid(matched, comparison_name, strategy_name, "Matched sample")
+  )
+
+  list(
+    summary = summary_df,
+    balance = balance_df,
+    descriptives = bind_rows(desc_pre, desc_post),
+    regressions = regressions
+  )
+}
+
+matched_runs <- tidyr::crossing(
+  comparison = names(matching_comparisons),
+  strategy = names(matching_strategies)
+) %>%
+  mutate(
+    result = map2(
+      comparison,
+      strategy,
+      ~ run_matching_analysis(
+        comparison_name = .x,
+        groups = matching_comparisons[[.x]],
+        strategy_name = .y,
+        match_covariates = matching_strategies[[.y]]
+      )
+    )
+  )
+
+matching_summary <- map_dfr(matched_runs$result, "summary")
+balance_tables <- map_dfr(matched_runs$result, "balance")
+matched_descriptives <- map_dfr(matched_runs$result, "descriptives")
+matched_regressions_raw <- map_dfr(matched_runs$result, "regressions")
+
+matched_regressions <- matched_regressions_raw %>%
+  mutate(
+    outcome_family = ifelse(outcome %in% names(bag_vars), "BAG", "EAA")
+  ) %>%
+  group_by(comparison, matching_strategy, sample, exposure, outcome_family) %>%
+  mutate(FDR = p.adjust(p_value, method = "fdr")) %>%
+  ungroup()
+
+matched_regressions_formatted <- matched_regressions %>%
+  transmute(
+    comparison,
+    matching_strategy,
+    sample,
+    exposure,
+    outcome_family,
+    outcome,
+    beta = round(beta, 3),
+    `95_CI` = format_ci(ci_low, ci_high, digits = 3),
+    beta_std = round(beta_std, 3),
+    `95_CI_std` = format_ci(ci_low_std, ci_high_std, digits = 3),
+    p_value = format_p(p_value),
+    FDR = format_p(FDR),
+    F_statistic = round(F_statistic, 2),
+    adj_r2 = round(adj_r2, 3),
+    n
+  )
+
+best_strategy <- matching_summary %>%
+  arrange(
+    comparison,
+    max_abs_smd_after,
+    desc(n_after)
+  ) %>%
+  group_by(comparison) %>%
+  slice(1) %>%
+  ungroup()
+
+writexl::write_xlsx(
+  list(
+    Matching_summary = matching_summary,
+    Best_strategy = best_strategy,
+    Balance_tables = balance_tables,
+    Descriptives = matched_descriptives,
+    Regressions_formatted = matched_regressions_formatted,
+    Regressions_raw = matched_regressions
+  ),
+  file.path(matched_output_dir, "matched_sample_sensitivity_results.xlsx")
+)
+
+write.csv(matching_summary, file.path(matched_output_dir, "matching_summary.csv"), row.names = FALSE)
+write.csv(balance_tables, file.path(matched_output_dir, "balance_tables.csv"), row.names = FALSE)
+write.csv(matched_regressions, file.path(matched_output_dir, "matched_regressions_raw.csv"), row.names = FALSE)
+write.csv(matched_regressions_formatted, file.path(matched_output_dir, "matched_regressions_formatted.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# Final console message
+# ------------------------------------------------------------
+
+cat("\n====================================================\n")
+cat("Sensitivity analyses completed.\n")
+cat("Outputs saved in:\n")
+cat(output_dir, "\n\n")
+cat("Main files:\n")
+cat("- association_sensitivity_results.xlsx\n")
+cat("- interaction_analyses/interaction_sensitivity_results.xlsx\n")
+cat("- matched_sample_analyses/matched_sample_sensitivity_results.xlsx\n")
+cat("====================================================\n")

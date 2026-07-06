@@ -1,0 +1,754 @@
+############################################################
+# Association Analyses
+#
+# This script performs the primary association analyses for
+# social exposome measures, epigenetic age acceleration (EAA),
+# and brain age gap (BAG).
+#
+# Analyses are performed in the full sample and within
+# diagnostic strata:
+#   - Dementia
+#   - Control
+#   - HC
+#   - AD
+#   - FTD
+#
+# Models included:
+#   1. Global social exposome -> EAA
+#   2. Social exposome domains -> EAA
+#   3. Global social exposome -> BAG
+#   4. Social exposome domains -> BAG
+#   5. Associations between EAA and BAG
+#
+# Model specifications:
+#   Full-sample EAA models:
+#     EAA ~ social exposure + age + sex + smoking + site + diagnosis
+#
+#   Stratified EAA models:
+#     EAA ~ social exposure + age + sex + smoking + site
+#
+#   Full-sample BAG models:
+#     BAG ~ social exposure + age + sex + smoking
+#
+#   Stratified BAG models:
+#     BAG ~ social exposure + age + sex + smoking
+#
+#   Full-sample EAA-BAG models:
+#     BAG ~ EAA + age + sex + smoking + site + diagnosis
+#
+#   Stratified EAA-BAG models:
+#     BAG ~ EAA + age + sex + smoking + site
+#
+# Outputs:
+#   - Raw and formatted regression tables
+#   - Standardized beta coefficients
+#   - 95% confidence intervals
+#   - Benjamini-Hochberg FDR
+#   - Adjusted R2
+#   - Partial Cohen's f2
+#   - Model-wise sample size
+############################################################
+
+# ------------------------------------------------------------
+# Packages
+# ------------------------------------------------------------
+
+required_packages <- c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "broom",
+  "tibble",
+  "stringr",
+  "openxlsx"
+)
+
+missing_packages <- required_packages[
+  !required_packages %in% rownames(installed.packages())
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(tibble)
+library(stringr)
+library(openxlsx)
+
+# ------------------------------------------------------------
+# Project configuration
+# ------------------------------------------------------------
+
+project_dir <- "."
+
+input_file <- file.path(project_dir, "data", "analysis_dataset.xlsx")
+
+output_dir <- file.path(project_dir, "results", "association_analyses")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+file_type <- "xlsx"   # options: "xlsx" or "csv"
+
+# ------------------------------------------------------------
+# Variable definitions
+# ------------------------------------------------------------
+# Replace only the values on the right with your local variable names.
+# Keep the object names on the left unchanged.
+
+# Covariates
+var_age       <- "age"
+var_sex       <- "sex"
+var_smoking   <- "smoking"
+var_site      <- "site"
+var_diagnosis <- "diagnosis_binary"
+var_clinical  <- "diagnosis_clinical"
+
+# Expected coding:
+# var_diagnosis: should identify Dementia and Control.
+# var_clinical: should identify HC, AD, and FTD.
+#
+# Edit these values if your dataset uses different labels.
+diagnosis_binary_levels <- list(
+  Dementia = c("Dementia", "dementia", "Case", "case", "1", 1),
+  Control  = c("Control", "control", "CN", "HC", "0", 0)
+)
+
+clinical_levels <- list(
+  HC  = c("HC", "CN", "Control", "control"),
+  AD  = c("AD", "Alzheimer", "Alzheimer disease"),
+  FTD = c("FTD", "Frontotemporal dementia")
+)
+
+# Global social exposures
+global_social_vars <- c(
+  CSRI = "CSRI",
+  MSE = "MSE_global_risk"
+)
+
+# Social exposome domains
+social_domain_vars <- c(
+  Education = "Education",
+  `Social support` = "Social_support",
+  Adversities = "Adversities",
+  Socioeconomics = "Socioeconomics"
+)
+
+# Epigenetic age acceleration measures
+eaa_vars <- c(
+  PhenoAge = "EAA_PhenoAge",
+  Hannum = "EAA_Hannum",
+  Horvath = "EAA_Horvath",
+  DNAmFitAge = "EAA_DNAmFitAge",
+  Blood = "EAA_Blood",
+  Brain = "EAA_Brain",
+  Heart = "EAA_Heart",
+  Immune = "EAA_Immune",
+  Inflammation = "EAA_Inflammation",
+  Kidney = "EAA_Kidney",
+  Liver = "EAA_Liver",
+  Lung = "EAA_Lung",
+  MusculoSkeletal = "EAA_MusculoSkeletal",
+  OMICmAge = "EAA_OMICmAge",
+  Retroclock = "EAA_Retroclock",
+  Hormone = "EAA_Hormone",
+  Metabolic = "EAA_Metabolic",
+  SystemsAge = "EAA_SystemsAge"
+)
+
+# Brain age gap measures
+bag_vars <- c(
+  `Functional BAG` = "BAG_funct",
+  `Structural BAG` = "BAG_structural"
+)
+
+# ------------------------------------------------------------
+# Data import
+# ------------------------------------------------------------
+
+if (file_type == "xlsx") {
+  dat_raw <- readxl::read_excel(input_file)
+} else if (file_type == "csv") {
+  dat_raw <- read.csv(input_file, stringsAsFactors = FALSE)
+} else {
+  stop("file_type must be either 'xlsx' or 'csv'.")
+}
+
+# ------------------------------------------------------------
+# Data preparation
+# ------------------------------------------------------------
+
+all_numeric_vars <- unique(c(
+  unname(global_social_vars),
+  unname(social_domain_vars),
+  unname(eaa_vars),
+  unname(bag_vars),
+  var_age
+))
+
+all_factor_vars <- unique(c(
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis,
+  var_clinical
+))
+
+required_vars <- unique(c(all_numeric_vars, all_factor_vars))
+missing_vars <- setdiff(required_vars, names(dat_raw))
+
+if (length(missing_vars) > 0) {
+  cat("\nMissing variables:\n")
+  print(missing_vars)
+  stop("Update the variable dictionary at the top of the script.")
+}
+
+dat <- dat_raw %>%
+  mutate(
+    across(all_of(all_numeric_vars), as.numeric),
+    across(all_of(all_factor_vars), as.factor)
+  )
+
+# ------------------------------------------------------------
+# Model specifications
+# ------------------------------------------------------------
+
+covars_eaa_full <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis
+)
+
+covars_eaa_stratified <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site
+)
+
+covars_bag_social_full <- c(
+  var_age,
+  var_sex,
+  var_smoking
+)
+
+covars_bag_social_stratified <- c(
+  var_age,
+  var_sex,
+  var_smoking
+)
+
+covars_bag_eaa_full <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site,
+  var_diagnosis
+)
+
+covars_bag_eaa_stratified <- c(
+  var_age,
+  var_sex,
+  var_smoking,
+  var_site
+)
+
+# ------------------------------------------------------------
+# Statistical functions
+# ------------------------------------------------------------
+
+format_p <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.001 ~ "<0.001",
+    p < 0.01 ~ "<0.01",
+    p < 0.05 ~ "<0.05",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+safe_sd <- function(x) {
+  x_sd <- sd(x, na.rm = TRUE)
+  if (is.na(x_sd) || x_sd == 0) return(NA_real_)
+  x_sd
+}
+
+fit_association_model <- function(data,
+                                  outcome_var,
+                                  predictor_var,
+                                  covariates,
+                                  analysis_name,
+                                  stratum_name,
+                                  outcome_label,
+                                  predictor_label) {
+
+  model_vars <- unique(c(outcome_var, predictor_var, covariates))
+
+  df <- data %>%
+    select(all_of(model_vars)) %>%
+    na.omit()
+
+  if (nrow(df) < 20) {
+    return(tibble(
+      analysis = analysis_name,
+      stratum = stratum_name,
+      predictor = predictor_label,
+      outcome = outcome_label,
+      predictor_raw = predictor_var,
+      outcome_raw = outcome_var,
+      n = nrow(df),
+      beta = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      beta_std = NA_real_,
+      ci_low_std = NA_real_,
+      ci_high_std = NA_real_,
+      p_value = NA_real_,
+      adj_r2 = NA_real_,
+      r2_full = NA_real_,
+      r2_reduced = NA_real_,
+      cohen_f2 = NA_real_,
+      covariates = paste(covariates, collapse = " + ")
+    ))
+  }
+
+  full_formula <- as.formula(
+    paste0(outcome_var, " ~ ", predictor_var, " + ", paste(covariates, collapse = " + "))
+  )
+
+  reduced_formula <- as.formula(
+    paste0(outcome_var, " ~ ", paste(covariates, collapse = " + "))
+  )
+
+  fit_full <- lm(full_formula, data = df)
+  fit_reduced <- lm(reduced_formula, data = df)
+
+  term_row <- broom::tidy(fit_full, conf.int = TRUE) %>%
+    filter(term == predictor_var)
+
+  if (nrow(term_row) != 1) {
+    warning(
+      "Predictor term not found as a single coefficient: ",
+      predictor_var,
+      " in model ",
+      deparse(full_formula)
+    )
+
+    return(tibble(
+      analysis = analysis_name,
+      stratum = stratum_name,
+      predictor = predictor_label,
+      outcome = outcome_label,
+      predictor_raw = predictor_var,
+      outcome_raw = outcome_var,
+      n = nrow(df),
+      beta = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      beta_std = NA_real_,
+      ci_low_std = NA_real_,
+      ci_high_std = NA_real_,
+      p_value = NA_real_,
+      adj_r2 = summary(fit_full)$adj.r.squared,
+      r2_full = summary(fit_full)$r.squared,
+      r2_reduced = summary(fit_reduced)$r.squared,
+      cohen_f2 = NA_real_,
+      covariates = paste(covariates, collapse = " + ")
+    ))
+  }
+
+  sd_x <- safe_sd(df[[predictor_var]])
+  sd_y <- safe_sd(df[[outcome_var]])
+
+  if (is.na(sd_x) || is.na(sd_y)) {
+    std_factor <- NA_real_
+  } else {
+    std_factor <- sd_x / sd_y
+  }
+
+  r2_full <- summary(fit_full)$r.squared
+  r2_reduced <- summary(fit_reduced)$r.squared
+
+  cohen_f2 <- (r2_full - r2_reduced) / (1 - r2_full)
+
+  tibble(
+    analysis = analysis_name,
+    stratum = stratum_name,
+    predictor = predictor_label,
+    outcome = outcome_label,
+    predictor_raw = predictor_var,
+    outcome_raw = outcome_var,
+    n = nrow(df),
+    beta = term_row$estimate,
+    ci_low = term_row$conf.low,
+    ci_high = term_row$conf.high,
+    beta_std = term_row$estimate * std_factor,
+    ci_low_std = term_row$conf.low * std_factor,
+    ci_high_std = term_row$conf.high * std_factor,
+    p_value = term_row$p.value,
+    adj_r2 = summary(fit_full)$adj.r.squared,
+    r2_full = r2_full,
+    r2_reduced = r2_reduced,
+    cohen_f2 = cohen_f2,
+    covariates = paste(covariates, collapse = " + ")
+  )
+}
+
+run_model_grid <- function(data,
+                           outcomes,
+                           predictors,
+                           covariates,
+                           analysis_name,
+                           stratum_name) {
+
+  tidyr::crossing(
+    outcome_label = names(outcomes),
+    predictor_label = names(predictors)
+  ) %>%
+    pmap_dfr(
+      function(outcome_label, predictor_label) {
+        fit_association_model(
+          data = data,
+          outcome_var = outcomes[[outcome_label]],
+          predictor_var = predictors[[predictor_label]],
+          covariates = covariates,
+          analysis_name = analysis_name,
+          stratum_name = stratum_name,
+          outcome_label = outcome_label,
+          predictor_label = predictor_label
+        )
+      }
+    ) %>%
+    group_by(analysis, stratum, outcome) %>%
+    mutate(FDR_by_outcome = p.adjust(p_value, method = "fdr")) %>%
+    ungroup() %>%
+    group_by(analysis, stratum) %>%
+    mutate(FDR_global = p.adjust(p_value, method = "fdr")) %>%
+    ungroup()
+}
+
+format_results <- function(df) {
+  df %>%
+    mutate(
+      beta_std = round(beta_std, 3),
+      ci_low_std = round(ci_low_std, 3),
+      ci_high_std = round(ci_high_std, 3),
+      `95_CI_std` = paste0("[", ci_low_std, ", ", ci_high_std, "]"),
+      p_value = format_p(p_value),
+      FDR_by_outcome = format_p(FDR_by_outcome),
+      FDR_global = format_p(FDR_global),
+      adj_r2 = round(adj_r2, 3),
+      cohen_f2 = round(cohen_f2, 3)
+    ) %>%
+    select(
+      analysis,
+      stratum,
+      predictor,
+      outcome,
+      beta_std,
+      `95_CI_std`,
+      p_value,
+      FDR_by_outcome,
+      FDR_global,
+      adj_r2,
+      cohen_f2,
+      n,
+      covariates,
+      predictor_raw,
+      outcome_raw
+    )
+}
+
+make_stratum <- function(data, stratum_name) {
+
+  if (stratum_name == "Full sample") {
+    return(data)
+  }
+
+  if (stratum_name %in% c("Dementia", "Control")) {
+    keep_values <- diagnosis_binary_levels[[stratum_name]]
+    return(data %>% filter(as.character(.data[[var_diagnosis]]) %in% as.character(keep_values)))
+  }
+
+  if (stratum_name %in% c("HC", "AD", "FTD")) {
+    keep_values <- clinical_levels[[stratum_name]]
+    return(data %>% filter(as.character(.data[[var_clinical]]) %in% as.character(keep_values)))
+  }
+
+  stop("Unknown stratum: ", stratum_name)
+}
+
+get_covariates_for_analysis <- function(analysis_name, stratum_name) {
+
+  is_full <- stratum_name == "Full sample"
+
+  if (analysis_name %in% c("global_social_to_EAA", "social_domains_to_EAA")) {
+    if (is_full) return(covars_eaa_full)
+    return(covars_eaa_stratified)
+  }
+
+  if (analysis_name %in% c("global_social_to_BAG", "social_domains_to_BAG")) {
+    if (is_full) return(covars_bag_social_full)
+    return(covars_bag_social_stratified)
+  }
+
+  if (analysis_name == "EAA_to_BAG") {
+    if (is_full) return(covars_bag_eaa_full)
+    return(covars_bag_eaa_stratified)
+  }
+
+  stop("Unknown analysis: ", analysis_name)
+}
+
+# ------------------------------------------------------------
+# Primary association analyses
+# ------------------------------------------------------------
+
+analysis_specs <- list(
+  global_social_to_EAA = list(
+    outcomes = eaa_vars,
+    predictors = global_social_vars,
+    description = "Global social exposome -> EAA"
+  ),
+  social_domains_to_EAA = list(
+    outcomes = eaa_vars,
+    predictors = social_domain_vars,
+    description = "Social exposome domains -> EAA"
+  ),
+  global_social_to_BAG = list(
+    outcomes = bag_vars,
+    predictors = global_social_vars,
+    description = "Global social exposome -> BAG"
+  ),
+  social_domains_to_BAG = list(
+    outcomes = bag_vars,
+    predictors = social_domain_vars,
+    description = "Social exposome domains -> BAG"
+  ),
+  EAA_to_BAG = list(
+    outcomes = bag_vars,
+    predictors = eaa_vars,
+    description = "Associations between EAA and BAG"
+  )
+)
+
+strata_to_run <- c(
+  "Full sample",
+  "Dementia",
+  "Control",
+  "HC",
+  "AD",
+  "FTD"
+)
+
+# ------------------------------------------------------------
+# Run association models
+# ------------------------------------------------------------
+
+all_results <- list()
+
+for (stratum_name in strata_to_run) {
+
+  cat("\n====================================================\n")
+  cat("Stratum:", stratum_name, "\n")
+
+  dat_s <- make_stratum(dat, stratum_name)
+
+  cat("N before model-wise complete case filtering:", nrow(dat_s), "\n")
+
+  for (analysis_name in names(analysis_specs)) {
+
+    spec <- analysis_specs[[analysis_name]]
+    covars <- get_covariates_for_analysis(analysis_name, stratum_name)
+
+    cat("Running:", analysis_name, "\n")
+    cat("Covariates:", paste(covars, collapse = " + "), "\n")
+
+    res <- run_model_grid(
+      data = dat_s,
+      outcomes = spec$outcomes,
+      predictors = spec$predictors,
+      covariates = covars,
+      analysis_name = analysis_name,
+      stratum_name = stratum_name
+    )
+
+    all_results[[paste(stratum_name, analysis_name, sep = "__")]] <- res
+  }
+}
+
+all_results_raw <- bind_rows(all_results)
+all_results_formatted <- format_results(all_results_raw)
+
+# ------------------------------------------------------------
+# Export results: CSV files
+# ------------------------------------------------------------
+
+write.csv(
+  all_results_raw,
+  file.path(output_dir, "association_results_all_raw.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_results_formatted,
+  file.path(output_dir, "association_results_all_formatted.csv"),
+  row.names = FALSE
+)
+
+# Separate CSV files
+for (stratum_name in strata_to_run) {
+  safe_stratum <- str_replace_all(stratum_name, "[^A-Za-z0-9]+", "_")
+
+  for (analysis_name in names(analysis_specs)) {
+    df_i <- all_results_raw %>%
+      filter(stratum == stratum_name, analysis == analysis_name)
+
+    write.csv(
+      df_i,
+      file.path(output_dir, paste0("raw_", safe_stratum, "_", analysis_name, ".csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      format_results(df_i),
+      file.path(output_dir, paste0("formatted_", safe_stratum, "_", analysis_name, ".csv")),
+      row.names = FALSE
+    )
+  }
+}
+
+# ------------------------------------------------------------
+# Export results: Excel workbook
+# ------------------------------------------------------------
+
+
+make_excel_sheet_name <- function(stratum_name, analysis_name, existing_names) {
+
+  stratum_code <- dplyr::case_when(
+    stratum_name == "Full sample" ~ "Full",
+    TRUE ~ stringr::str_replace_all(stratum_name, "[^A-Za-z0-9]+", "_")
+  )
+
+  analysis_code <- dplyr::case_when(
+    analysis_name == "global_social_to_EAA" ~ "GlobSoc_EAA",
+    analysis_name == "social_domains_to_EAA" ~ "Domains_EAA",
+    analysis_name == "global_social_to_BAG" ~ "GlobSoc_BAG",
+    analysis_name == "social_domains_to_BAG" ~ "Domains_BAG",
+    analysis_name == "EAA_to_BAG" ~ "EAA_BAG",
+    TRUE ~ stringr::str_replace_all(analysis_name, "[^A-Za-z0-9]+", "_")
+  )
+
+  base_name <- substr(paste0(stratum_code, "_", analysis_code), 1, 31)
+  sheet_name <- base_name
+  suffix <- 1
+
+  while (sheet_name %in% existing_names) {
+    suffix_txt <- paste0("_", suffix)
+    sheet_name <- paste0(substr(base_name, 1, 31 - nchar(suffix_txt)), suffix_txt)
+    suffix <- suffix + 1
+  }
+
+  sheet_name
+}
+
+wb <- createWorkbook()
+
+# One formatted sheet per analysis x stratum
+existing_sheet_names <- character(0)
+
+for (stratum_name in strata_to_run) {
+
+  for (analysis_name in names(analysis_specs)) {
+
+    sheet_name <- make_excel_sheet_name(
+      stratum_name = stratum_name,
+      analysis_name = analysis_name,
+      existing_names = existing_sheet_names
+    )
+
+    existing_sheet_names <- c(existing_sheet_names, sheet_name)
+
+    df_sheet <- all_results_raw %>%
+      filter(stratum == stratum_name, analysis == analysis_name) %>%
+      format_results()
+
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, df_sheet)
+    setColWidths(wb, sheet_name, cols = 1:ncol(df_sheet), widths = "auto")
+  }
+}
+
+# Summary sheet
+summary_table <- all_results_raw %>%
+  mutate(
+    sig_nominal = p_value < 0.05,
+    sig_fdr_by_outcome = FDR_by_outcome < 0.05,
+    sig_fdr_global = FDR_global < 0.05
+  ) %>%
+  group_by(stratum, analysis) %>%
+  summarise(
+    n_tests = n(),
+    n_nominal = sum(sig_nominal, na.rm = TRUE),
+    n_fdr_by_outcome = sum(sig_fdr_by_outcome, na.rm = TRUE),
+    n_fdr_global = sum(sig_fdr_global, na.rm = TRUE),
+    mean_abs_beta_std = mean(abs(beta_std), na.rm = TRUE),
+    max_abs_beta_std = max(abs(beta_std), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+addWorksheet(wb, "Summary")
+writeData(wb, "Summary", summary_table)
+setColWidths(wb, "Summary", cols = 1:ncol(summary_table), widths = "auto")
+
+# Raw all
+addWorksheet(wb, "All_raw")
+writeData(wb, "All_raw", all_results_raw)
+setColWidths(wb, "All_raw", cols = 1:ncol(all_results_raw), widths = "auto")
+
+# Formatted all
+addWorksheet(wb, "All_formatted")
+writeData(wb, "All_formatted", all_results_formatted)
+setColWidths(wb, "All_formatted", cols = 1:ncol(all_results_formatted), widths = "auto")
+
+# Model information
+model_info <- tibble(
+  Analysis = names(analysis_specs),
+  Description = map_chr(analysis_specs, "description"),
+  Full_sample_covariates = map_chr(
+    names(analysis_specs),
+    ~ paste(get_covariates_for_analysis(.x, "Full sample"), collapse = " + ")
+  ),
+  Stratified_covariates = map_chr(
+    names(analysis_specs),
+    ~ paste(get_covariates_for_analysis(.x, "Dementia"), collapse = " + ")
+  ),
+  FDR = "Benjamini-Hochberg correction applied within each analysis, stratum, and outcome; global FDR also provided within each analysis and stratum",
+  Effect_size = "Standardized beta and partial Cohen's f2 for the focal predictor"
+)
+
+addWorksheet(wb, "Model_info")
+writeData(wb, "Model_info", model_info)
+setColWidths(wb, "Model_info", cols = 1:ncol(model_info), widths = "auto")
+
+saveWorkbook(
+  wb,
+  file.path(output_dir, "association_results_all_strata.xlsx"),
+  overwrite = TRUE
+)
+
+cat("\n====================================================\n")
+cat("All association analyses completed.\n")
+cat("Outputs saved in:\n")
+cat(output_dir, "\n\n")
+cat("Main files:\n")
+cat("- association_results_all_raw.csv\n")
+cat("- association_results_all_formatted.csv\n")
+cat("- association_results_all_strata.xlsx\n")
+cat("====================================================\n")
